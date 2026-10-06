@@ -21,6 +21,7 @@ import {
   browserInvolved,
   closeout,
   closeoutGated,
+  closeoutEpoch,
   closeoutLedger,
   ledger,
   lease,
@@ -2576,6 +2577,58 @@ describe("AP.audit rule 7 — closeout evidence drift (#277)", () => {
     const rep = audit({ tickets: [implMk({ number: 257 })] }, { now: NOW });
     expect(rep.drift).toHaveLength(0);
   });
+
+  // #421 — the first shot fired rule 7 on ~78 tickets (#17–#313) that closed
+  // before the ledger existed (2026-10-04/06): backfilling them would be
+  // fabricating evidence for a gate that never ran. Epoch-pre = silent.
+  it("#421 epoch: tickets closed before the ledger's first recordedAt stay silent", () => {
+    const epochLedger = [
+      acceptedEvent({ number: 396, recordedAt: "2026-10-06T16:51:56.143Z" }),
+    ];
+    const pre = implMk({ number: 277, closedAt: "2026-10-04T00:00:00Z" });
+    const rep = audit({ tickets: [pre] }, { closeouts: epochLedger, now: NOW });
+    expect(rep.clean).toBe(true);
+  });
+
+  it("#421 epoch: post-epoch delivery with no entry still fires; the boundary is strict", () => {
+    const epochLedger = [
+      acceptedEvent({ number: 396, recordedAt: "2026-10-06T16:51:56.143Z" }),
+    ];
+    const after = implMk({ number: 430, closedAt: "2026-10-06T17:18:08.551Z" });
+    const atEpoch = implMk({ number: 431, closedAt: "2026-10-06T16:51:56.143Z" });
+    const rep = audit({ tickets: [after, atEpoch] }, { closeouts: epochLedger, now: NOW });
+    expect(rep.drift.map((d) => [d.rule, d.number])).toEqual([
+      ["closeoutNoEvidence", 430],
+      ["closeoutNoEvidence", 431],
+    ]);
+  });
+
+  it("#421 epoch: no closedAt (status-delivered) cannot claim the pre-era; an empty ledger anchors nothing", () => {
+    const epochLedger = [
+      acceptedEvent({ number: 396, recordedAt: "2026-10-06T16:51:56.143Z" }),
+    ];
+    const statusDelivered = implMk({ number: 432, state: "OPEN", status: "Done" });
+    expect(
+      audit({ tickets: [statusDelivered] }, { closeouts: epochLedger, now: NOW }).drift.map(
+        (d) => d.rule,
+      ),
+    ).toEqual(["closeoutNoEvidence"]);
+    const preEra = implMk({ number: 433, closedAt: "2026-09-01T00:00:00Z" });
+    expect(
+      audit({ tickets: [preEra] }, { closeouts: [], now: NOW }).drift.map((d) => d.rule),
+    ).toEqual(["closeoutNoEvidence"]);
+  });
+
+  it("closeoutEpoch is the earliest parseable recordedAt; unparseable rows never anchor it", () => {
+    expect(
+      closeoutEpoch([
+        acceptedEvent({ number: 1, recordedAt: "2026-10-06T17:18:08.551Z" }),
+        acceptedEvent({ number: 2, recordedAt: "2026-10-06T16:51:56.143Z" }),
+      ]),
+    ).toBe(Date.parse("2026-10-06T16:51:56.143Z"));
+    expect(closeoutEpoch([acceptedEvent({ number: 1, recordedAt: "not-a-date" })])).toBeNull();
+    expect(closeoutEpoch([])).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2591,6 +2644,28 @@ describe("proseDependencies (pure, #393)", () => {
     expect(proseDependencies("blocked by #240 until its merge")).toEqual([240]);
     expect(proseDependencies("须先合入 #300 的分支")).toEqual([300]);
     expect(proseDependencies("随手提 #123 与 #456")).toEqual([]);
+  });
+
+  it("#421: 关联/参见/来源 sections are never scanned; a later mechanism section resumes", () => {
+    const body = [
+      "## 修法",
+      "前置 #387 合入后再动。",
+      "## 关联",
+      "#412（cutover 伞）；#397（合并前置=本票+secrets）。",
+      "blocked 关系：#397 合并 ← 本票。",
+      "## 任务",
+      "blocked by #390 先行",
+    ].join("\n");
+    expect(proseDependencies(body)).toEqual([387, 390]);
+  });
+
+  it("#421: reverse narration (← / 前置=本票) demands no this→#n edge", () => {
+    // live #412 line: the arrow says #397 waits on THIS ticket.
+    expect(proseDependencies("blocked 关系：#397 合并 ← 本票。")).toEqual([]);
+    // live #420 glue: the prerequisite IS this ticket.
+    expect(proseDependencies("依赖 #397（合并前置=本票+secrets）。")).toEqual([]);
+    // forward narration keeps counting.
+    expect(proseDependencies("前置 #387 合入")).toEqual([387]);
   });
 });
 
@@ -2778,6 +2853,134 @@ describe("AP.audit rule 8 — proseDependencyWithoutEdge (#393)", () => {
     });
     expect(rep.drift).toHaveLength(1);
     expect(rep.drift[0]?.detail).toContain("#387, #390");
+  });
+
+  it("#421 #412-shape: reverse narration with the edge materialized the other way stays silent", () => {
+    // live first shot: the rule read #412's 关联 line as "#412 blocked by
+    // #397" while the board truth was (and is) #397 blockedBy #412.
+    const rep = audit({
+      tickets: [
+        mk({
+          number: 412,
+          body: "## 关联\n\nblocked 关系：#397 合并 ← 本票。SEC-W5-001（critical）修复已就绪待钥。",
+        }),
+        mk({ number: 397, blockedBy: [{ number: 412, state: "OPEN", title: "t412" }] }),
+      ],
+    });
+    expect(rep.clean).toBe(true);
+  });
+
+  it("#421: reverse narration stays silent even before the reverse edge exists — no wrong-direction demand", () => {
+    const rep = audit({
+      tickets: [
+        mk({ number: 413, body: "## 修法\nblocked 关系：#397 合并 ← 本票。" }),
+        mk({ number: 397 }),
+      ],
+    });
+    expect(rep.clean).toBe(true);
+  });
+
+  it("#421 #420-shape: a 关联 section naming #n beside dependency words is not an edge demand", () => {
+    const rep = audit({
+      tickets: [
+        mk({
+          number: 420,
+          body: "## 验收\n\n- L1 绿+CI 绿\n\n## 关联\n\n#412（cutover 伞）；#397（合并前置=本票+secrets）。",
+        }),
+        mk({ number: 412 }),
+        mk({ number: 397 }),
+      ],
+    });
+    expect(rep.clean).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #421 first-shot replay — the 2026-10-06 OOM-morning audit returned 84
+// findings; 80 were noise (rule 7 over the pre-ledger #17–#313 back-catalogue,
+// rule 9 on #412's reverse narration and #420's 关联 section). The four true
+// repairs (lane 状态×2 + 租约×2) must survive; everything else stays silent.
+// ---------------------------------------------------------------------------
+
+describe("#421 first-shot replay — 84 findings decompose to the 4 true repairs", () => {
+  const NOW = new Date("2026-10-06T18:00:00Z");
+  const mk = (over: Partial<Ticket> & Pick<Ticket, "number">): Ticket => ({
+    id: `I${over.number}`,
+    title: `t${over.number}`,
+    body: "",
+    state: "OPEN",
+    updatedAt: "2026-10-06T12:00:00Z",
+    milestone: "W5",
+    labels: [],
+    blockedBy: [],
+    itemId: `PVTItem_${over.number}`,
+    status: "Todo",
+    priority: null,
+    ...over,
+  });
+  const delivered = (over: Partial<Ticket> & Pick<Ticket, "number">): Ticket =>
+    mk({
+      state: "CLOSED",
+      status: "Done",
+      labels: ["type:implementation", "block:agent-harness"],
+      closedAt: "2026-09-30T00:00:00Z",
+      ...over,
+    });
+  // Live-ledger shape: earliest row 2026-10-06T16:51:56.143Z (.pm-closeouts
+  // row 1) — every back-catalogue closing predates it.
+  const closeouts = [
+    acceptedEvent({ number: 396, recordedAt: "2026-10-06T16:51:56.143Z" }),
+    acceptedEvent({ number: 323, recordedAt: "2026-10-06T16:58:48.898Z" }),
+  ];
+
+  it("78 epoch-pre closings + 2 rule-9 narrations stay silent; lane×2 + lease×2 survive", () => {
+    const backCatalogue: Ticket[] = Array.from({ length: 78 }, (_, i) =>
+      delivered({ number: 17 + i * 3 }),
+    );
+    const tickets: Ticket[] = [
+      // the four true repairs' board facts: two live lanes with lost flips…
+      mk({ number: 425, status: "Todo" }),
+      mk({ number: 426, status: "Todo" }),
+      ...backCatalogue,
+      // …the two rule-9 noise shapes, open…
+      mk({
+        number: 412,
+        body: "## 关联\n\nblocked 关系：#397 合并 ← 本票。SEC-W5-001（critical）修复已就绪待钥。",
+      }),
+      mk({ number: 397, blockedBy: [{ number: 412, state: "OPEN", title: "t412" }] }),
+      mk({ number: 421, body: "## 关联\n\n#412（cutover 伞）；#397（合并前置=本票+secrets）。" }),
+      // …and the two lease repairs: unleased browser lane + lease past delivery.
+      mk({ number: 440, status: "In Progress", title: "l440-walk CDP 面板验收" }),
+      delivered({ number: 441, title: "l441-walk CDP 面板验收" }),
+    ];
+    const rep = audit(
+      { tickets },
+      {
+        activeLanes: [425, 426, 440],
+        leases: [
+          leaseAcquire({
+            lane: "lane-441-accept",
+            tabName: "l441",
+            threadPrefix: "l441-",
+            number: 441,
+          }),
+        ],
+        closeouts,
+        now: NOW,
+      },
+    );
+    expect(rep.drift.map((d) => [d.rule, d.number])).toEqual([
+      ["laneStatusMismatch", 425],
+      ["laneStatusMismatch", 426],
+      ["browserLeaseMissing", 440],
+      ["browserLeaseUnreleased", 441],
+    ]);
+    expect(rep.mutations).toEqual([
+      { op: "setStatus", number: 425, value: "In Progress" },
+      { op: "setStatus", number: 426, value: "In Progress" },
+    ]);
+    expect(rep.drift.filter((d) => d.rule === "closeoutNoEvidence")).toHaveLength(0);
+    expect(rep.drift.filter((d) => d.rule === "proseDependencyWithoutEdge")).toHaveLength(0);
   });
 });
 

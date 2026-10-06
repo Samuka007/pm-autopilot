@@ -49,6 +49,8 @@
  *                                      // rule 7 closeoutNoEvidence: a delivered
  *                                      // type:implementation/type:bug ticket with
  *                                      // no accepted entry — backfill or reopen.
+ *                                      // #421: tickets closed before the ledger's
+ *                                      // first recordedAt predate the gate — silent.
  *
  * Acceptance-face gate (#390): AP.closeout reads the ticket itself before
  * writing (the board is the only truth — never the caller's summary). A
@@ -126,7 +128,9 @@
  * dependency (依赖/前置/须先/倒查/blocked + #n) at a ticket on this board with
  * no blockedBy edge to match: advisory (mutation: null), the repair is an
  * apply edge or a blockedBy dispatch arg. Re-run audit after the apply:
- * `clean` is the beat's green light.
+ * `clean` is the beat's green light. #421 noise guards: 关联/参见/来源
+ * sections are never scanned (cross-reference, not mechanism) and reverse
+ * narration (`#n 合并 ← 本票` / `前置=本票`) demands no this→#n edge.
  *
  * Shared-resource lease ledger (#240) — browser (CDP/thread) first. 口头纪律
  * 结构化 (#239 comment 5988466175): every browser lane holds a NAMED tab and a
@@ -268,6 +272,12 @@ export interface Ticket {
   /** Last issue update, ISO 8601 (#181 rule-4 aging proxy — any issue event
    *  refreshes it; reminder input, never a guard input). */
   updatedAt: string;
+  /** Issue close time, ISO 8601; null while OPEN. Rule-7 epoch input (#421):
+   *  a ticket closed before the closeout ledger's first row predates the
+   *  gate — demanding backfilled evidence would be fabricating history.
+   *  Optional so hand-built tickets (tests, offline flows) stay honest:
+   *  absent = cannot establish the pre-era, rule 7 keeps firing. */
+  closedAt?: string | null;
   /** ProjectV2Item id; null = not boarded yet (sync boards on events). */
   itemId: string | null;
   status: StatusName | null;
@@ -580,6 +590,7 @@ export const TEMPLATES = {
         priority: fieldValueByName(name: "Priority") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
         content { __typename ... on Issue {
           id number title state bodyText updatedAt
+          closedAt
           milestone { title }
           labels(first: 50) { nodes { name } }
           blockedBy(first: 50) { nodes { number state title } }
@@ -588,6 +599,7 @@ export const TEMPLATES = {
   repository(owner: $owner, name: $repo) {
     issues(states: OPEN, first: 100, after: $issueCursor) { pageInfo { hasNextPage endCursor }
       nodes { id number title state bodyText updatedAt
+        closedAt
         milestone { title }
         labels(first: 50) { nodes { name } }
         blockedBy(first: 50) { nodes { number state title } }
@@ -671,6 +683,7 @@ interface RawIssueNode {
   state: IssueState;
   bodyText: string | null;
   updatedAt: string;
+  closedAt?: string | null;
   milestone: { title: string } | null;
   labels: { nodes: { name: string }[] | null } | null;
   blockedBy: { nodes: { number: number; state: IssueState; title: string }[] | null } | null;
@@ -2102,6 +2115,23 @@ export function acceptedNumbers(events: readonly CloseoutEvent[]): Set<number> {
   return new Set(events.map((e) => e.number));
 }
 
+/** #421 rule-7 epoch: the ledger's earliest recording. Tickets CLOSED before
+ *  it predate the gate — the 实现→验收→关账 sequence (#277, fixed 2026-10-04)
+ *  did not exist when they closed, and "backfill" would be fabricating
+ *  evidence for a gate that never ran. Rows with unparseable timestamps are
+ *  skipped; a ledger with none yields null = no epoch = rule 7 armed on every
+ *  delivered ticket (the honest empty store: nothing recorded, nothing
+ *  exempted). */
+export function closeoutEpoch(events: readonly CloseoutEvent[]): number | null {
+  let min: number | null = null;
+  for (const e of events) {
+    const at = Date.parse(e.recordedAt);
+    if (Number.isNaN(at)) continue;
+    if (min === null || at < min) min = at;
+  }
+  return min;
+}
+
 /** Code-delivering tickets the gate covers (#277: 实现票交付→验收 lane 出证据
  *  →才可 merge/close). The W4 regression the gate answers (#254/#257/#266)
  *  carried exactly these labels; docs/research/decision tickets ship no
@@ -2147,7 +2177,7 @@ const PRODUCT_FACE_PATTERN = /走查|真机|手验|截图|面板|界面|浏览�
  *  (live #362/#382/#386/#387/#390/#391 bodies; prefix-match, so 参考类预测
  *  ends a section the way 参考 does). Prefix words first so the alternation
  *  names the longest form. */
-const SECTION_HEAD_WORDS = "验收标准|验收判据|验收|任务|修法|方案|非目标|证据|参考";
+const SECTION_HEAD_WORDS = "验收标准|验收判据|验收|任务|修法|方案|非目标|证据|参考|关联|参见|来源";
 
 /** The gate reads GraphQL bodyText — markdown RENDERED TO TEXT, where
  *  `## 验收` arrives as the bare line `验收` (#402 probe: every markdown-
@@ -2551,10 +2581,35 @@ export function walkLedger(opts: WalkOptions = {}): {
  *  a body-wide window drags in every incidental issue mention. */
 export const PROSE_DEPENDENCY_PATTERN = /依赖|前置|须先|倒查|blocked/i;
 
-/** Declared-dependency numbers in a body, first-seen order, deduped. */
+/** #421 reference sections — 关联/参见/来源 prose is cross-reference for the
+ *  reader, not mechanism narration: "#420 的关联节提及 #412/#397 触发依赖词"
+ *  (first-shot noise). Same boundary discipline as the acceptance section
+ *  (SECTION_HEAD_PATTERN above, which these heads also terminate). */
+const REFERENCE_SECTION_PATTERN = new RegExp(
+  `^(?:#{1,6}[^\\S\\n]*)?(?:关联|参见|来源)[^\\n]*$`,
+  "m",
+);
+
+/** #421 reverse narration — the line says the OTHER ticket waits on this one
+ *  (`#397 合并 ← 本票`, `合并前置=本票`; first shot read #412's line as
+ *  "#412 blocked by #397" while the materialized truth was #397 blockedBy
+ *  #412). Reading such a line as this.blockedBy #n inverts the declared
+ *  direction; the line produces no forward edge. */
+export const PROSE_REVERSE_PATTERN = /←|(?:前置|blocked\s*by|依赖|须先)\s*[=：:]?\s*本票/;
+
+/** Declared-dependency numbers in a body, first-seen order, deduped.
+ *  #421: reference-section content (关联/参见/来源, through the next section
+ *  head or EOF) and reverse-narration lines produce nothing — a mention is
+ *  not an edge demand in the wrong direction. */
 export function proseDependencies(body: string): number[] {
   const refs: number[] = [];
+  let inReferenceSection = false;
   for (const line of body.split("\n")) {
+    if (SECTION_HEAD_PATTERN.test(line) || REFERENCE_SECTION_PATTERN.test(line)) {
+      inReferenceSection = REFERENCE_SECTION_PATTERN.test(line);
+      continue;
+    }
+    if (inReferenceSection || PROSE_REVERSE_PATTERN.test(line)) continue;
     if (!PROSE_DEPENDENCY_PATTERN.test(line)) continue;
     for (const m of line.matchAll(/#(\d+)/g)) {
       const n = Number(m[1]);
@@ -2629,7 +2684,9 @@ export interface AuditOptions {
   leases?: readonly LeaseEvent[];
   /** Rule-7 input (#277): the closeout ledger — pass
    *  `AP.closeoutLedger().events`. Omitted → rule 7 is silent: a missing
-   *  ledger must never fabricate closeout findings. */
+   *  ledger must never fabricate closeout findings. #421 epoch: tickets
+   *  CLOSED before the ledger's first recordedAt predate the gate and stay
+   *  silent — backfilling them would fabricate evidence. */
   closeouts?: readonly CloseoutEvent[];
   /** Rule-8 input (#391): the walk-due ledger — pass
    *  `AP.walkLedger().events`. Omitted → rule 8 is silent: a missing
@@ -2674,7 +2731,10 @@ export interface AuditOptions {
  *     merged/closed on self-report alone. Repair is an action, not a board
  *     write: `AP.closeout(...)` backfills the evidence trio (回填, #266 the
  *     first case) or the ticket reopens. Docs/research/decision tickets ship
- *     no runtime surface and are outside the gate.
+ *     no runtime surface and are outside the gate. #421 epoch boundary:
+ *     tickets closed before the ledger's earliest recordedAt predate the
+ *     gate (the #17–#313 back-catalogue) and stay SILENT — 回填 would be
+ *     fabricating evidence for a gate that did not exist.
  *  8. walkDueOverdue (#391, armed by `opts.walks`) — an active walk deferral
  *     whose due date has passed with no settlement: 到期翻红. An open ticket
  *     not already red gets the board write itself (Status → Wait for user);
@@ -2689,7 +2749,12 @@ export interface AuditOptions {
  *     (mutation: null, 观察一波 before any refusal upgrade): the repair is
  *     `AP.apply([{ op: "addBlockedBy", ... }])` or the dispatch arg
  *     `AP.lane(t, {}, { blockedBy: [n] })`. Self-references, off-board
- *     numbers, and already-edged dependencies stay silent.
+ *     numbers, and already-edged dependencies stay silent. #421 noise
+ *     guards: 关联/参见/来源 sections are cross-reference, not mechanism —
+ *     content there is never scanned; and reverse narration (`#n 合并 ←
+ *     本票`, `前置=本票` — the other ticket waits on this one) produces no
+ *     this→#n edge demand, the first shot having read #412's materialized
+ *     `#397 blockedBy #412` as its own inversion.
  */
 export function audit(snap: Pick<Snapshot, "tickets">, opts: AuditOptions = {}): AuditReport {
   const drift: DriftFinding[] = [];
@@ -2840,11 +2905,20 @@ export function audit(snap: Pick<Snapshot, "tickets">, opts: AuditOptions = {}):
 
   // Rule 7 (#277): a delivered code ticket with nothing on the closeout
   // ledger — the acceptance-lane gate did not run before merge/close.
+  // #421 epoch boundary: a ticket CLOSED before the ledger's first row
+  // predates the gate — stay silent (backfilling would fabricate evidence).
   if (opts.closeouts !== undefined) {
     const accepted = acceptedNumbers(opts.closeouts);
+    const epoch = closeoutEpoch(opts.closeouts);
     for (const t of snap.tickets) {
       const delivered = t.state === "CLOSED" || t.status === "Done" || t.status === "Canceled";
       if (!delivered || !closeoutGated(t.labels) || accepted.has(t.number)) continue;
+      if (epoch !== null) {
+        const closedMs = t.closedAt === null || t.closedAt === undefined
+          ? Number.NaN
+          : Date.parse(t.closedAt);
+        if (!Number.isNaN(closedMs) && closedMs < epoch) continue;
+      }
       drift.push({
         rule: "closeoutNoEvidence",
         number: t.number,
@@ -3189,6 +3263,7 @@ function rawToTicket(raw: RawIssueNode): Ticket {
     body: raw.bodyText ?? "",
     state: raw.state,
     updatedAt: raw.updatedAt,
+    closedAt: raw.closedAt ?? null,
     milestone: raw.milestone?.title ?? null,
     labels: (raw.labels?.nodes ?? []).map((l) => l.name),
     blockedBy: (raw.blockedBy?.nodes ?? []).map((b) => ({
@@ -4225,6 +4300,7 @@ export const AP = {
     browserInvolved,
     activeLeases,
     acceptedNumbers,
+    closeoutEpoch,
     closeoutGated,
     acceptanceFaceOf,
     acceptanceSectionOf,
