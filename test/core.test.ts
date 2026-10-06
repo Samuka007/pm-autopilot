@@ -442,6 +442,10 @@ describe("pure core", () => {
     expect(packet?.context).toContain("墙钟 ≤ 60min");
     expect(packet?.worktree.command).toContain("herdr worktree create");
     expect(packet?.worktree.command).toContain("--branch lane/131-infra-pm-autopilot-eval");
+    // #419: the lane close-out self-check rides every packet — non-deliverables
+    // (tool-output sidecars) are cleaned before the report, never shipped.
+    expect(packet?.context).toContain("# Close-out self-check (#419");
+    expect(packet?.context).toContain("*:conflicts");
     // A true negative: no budget keyword, no wall-clock figure anywhere.
     const [skeleton] = dispatchPackets([{ ...t, body: "nothing relevant on this line" }]);
     expect(skeleton?.budget.source).toBe("skeleton");
