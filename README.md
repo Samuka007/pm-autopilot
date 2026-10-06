@@ -77,8 +77,10 @@ Reproducible from zero (fresh machine, no defaults in env):
 
 ```sh
 export PM_REPO="you/your-repo"
-export PM_PROJECT_ID="$(gh project list --repo you/your-repo --format json | jq -r '.projects[0].id')"
+# copy the "id" (the PVT_… GraphQL id) of your board from:
+gh project list --owner you --format json
 export GH_TOKEN="$(gh auth token)"
+export PM_PROJECT_ID="PVT_yourBoardId"
 omp plugin link /path/to/pm-autopilot
 ```
 
