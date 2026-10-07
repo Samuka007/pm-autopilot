@@ -1,7 +1,8 @@
 {
   "name": "pm-autopilot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "description": "PM state machine for agent fleets as an omp custom-tool family: pm_lane / pm_apply / pm_audit / pm_release / pm_ledger / pm_walk_ledger / pm_walk",
   "omp": {
@@ -9,11 +10,21 @@
     "description": "pm-autopilot board tools: lane dispatch, guarded board writes, drift audit (walk-due rule 8), browser-lease + walk ledgers",
     "tools": "./src/tools.ts"
   },
+  "files": [
+    "src",
+    "scripts",
+    "agents",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "codegen": "graphql-codegen --config codegen.yml",
     "schema:sync": "node scripts/sync-schema.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "pnpm typecheck && pnpm test"
   },
   "devDependencies": {
     "@graphql-codegen/cli": "^7.4.4",
