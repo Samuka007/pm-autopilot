@@ -18,5 +18,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # #4 drift gate: committed generated types must match what codegen
+      # emits from the vendored schema + documents (all offline, local SDL).
+      - run: pnpm codegen && git diff --exit-code -- src/generated
       - run: pnpm typecheck
       - run: pnpm test

@@ -221,6 +221,29 @@ import { Octokit } from "octokit";
 
 import { createInstallationTokenProvider, resolveAppCredentials } from "./identity.js";
 import { validateWalkSpec, walk, walkVerdict } from "./walk.js";
+import {
+  AddBlockedByDocument,
+  AddLabelsDocument,
+  AddProjectItemDocument,
+  CloseIssueDocument,
+  CloseoutTicketDocument,
+  CreateIssueDocument,
+  DeleteProjectItemDocument,
+  IssueNodeIdDocument,
+  ProjectFieldsDocument,
+  RepoLabelIdDocument,
+  RepoOpenMilestonesDocument,
+  RepoVocabularyDocument,
+  SetMilestoneDocument,
+  SetSingleSelectDocument,
+  SnapshotDocument,
+  type TypedDocumentNode,
+} from "./graphql/documents.js";
+import type {
+  CloseoutTicketQuery,
+  RepoVocabularyQuery,
+  SnapshotQuery,
+} from "./generated/graphql.js";
 
 export type {
   WalkCheck,
@@ -556,9 +579,19 @@ const defaultGql: GqlFn = (query, variables) => {
   return defaultGqlClient(query, variables);
 };
 
-function gql(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
+/** Typed front door (#4): every document constant carries its generated
+ *  result/variable types as phantom fields, so each call site is
+ *  compile-checked against GitHub's real schema — a misshapen variables
+ *  object is a type error, and results come back typed. The wire contract
+ *  is untouched (`GqlFn`: plain string + variables); the single `as` below
+ *  is the one trusted boundary between the generated types and the untyped
+ *  transport seam. */
+function gql<TResult, TVariables extends Record<string, unknown>>(
+  document: TypedDocumentNode<TResult, TVariables>,
+  variables: TVariables,
+): Promise<TResult> {
   const fn = injected?.gql ?? defaultGql;
-  return fn(query, variables);
+  return fn(document, variables) as Promise<TResult>;
 }
 
 /** JEV_API_KEY: process env first, then the gitignored .env.local (cwd, then
@@ -621,86 +654,13 @@ export const defaultJudge: JudgeFn = async (state, questions) => {
 };
 
 // ---------------------------------------------------------------------------
-// GraphQL documents — recorded request templates (known-good shapes; the
-// project patterns are verbatim from .github/workflows/project-board-sync.yml)
+// GraphQL documents — moved to src/graphql/documents.ts (#4): codegen-typed
+// against the vendored live-API SDL (src/graphql/schema.graphql), so every
+// document and its result shape are compile-checked. The one exception is
+// the aliased verification batch below (verifyQuery): its alias set is only
+// known at runtime, so it stays a runtime-composed string behind a
+// hand-written result type.
 // ---------------------------------------------------------------------------
-
-/** Docs/templates the L1 suite asserts issued calls against. */
-export const TEMPLATES = {
-  snapshot: `query($id: ID!, $owner: String!, $repo: String!, $itemCursor: String, $issueCursor: String) {
-  project: node(id: $id) { ... on ProjectV2 {
-    items(first: 100, after: $itemCursor) { pageInfo { hasNextPage endCursor }
-      nodes { id
-        status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
-        priority: fieldValueByName(name: "Priority") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
-        content { __typename ... on Issue {
-          id number title state bodyText updatedAt
-          closedAt
-          milestone { title }
-          labels(first: 50) { nodes { name } }
-          blockedBy(first: 50) { nodes { number state title } }
-        } }
-      } } } }
-  repository(owner: $owner, name: $repo) {
-    issues(states: OPEN, first: 100, after: $issueCursor) { pageInfo { hasNextPage endCursor }
-      nodes { id number title state bodyText updatedAt
-        closedAt
-        milestone { title }
-        labels(first: 50) { nodes { name } }
-        blockedBy(first: 50) { nodes { number state title } }
-      } } }
-}`,
-  fields: `query($id: ID!) { node(id: $id) { ... on ProjectV2 {
-  fields(first: 20) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } } }
-} } }`,
-  addProjectItem: `mutation($projectId: ID!, $contentId: ID!) {
-  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } }
-}`,
-  setSingleSelect: `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-  updateProjectV2ItemFieldValue(input: {
-    projectId: $projectId
-    itemId: $itemId
-    fieldId: $fieldId
-    value: { singleSelectOptionId: $optionId }
-  }) { projectV2Item { id } }
-}`,
-  setMilestone: `mutation($id: ID!, $milestoneId: ID) {
-  updateIssue(input: { id: $id, milestoneId: $milestoneId }) { issue { number } }
-}`,
-  addBlockedBy: `mutation($issueId: ID!, $blockingIssueId: ID!) {
-  addBlockedBy(input: { issueId: $issueId, blockingIssueId: $blockingIssueId }) { issue { number } }
-}`,
-  addLabels: `mutation($labelableId: ID!, $labelIds: [ID!]) {
-  addLabelsToLabelable(input: { labelableId: $labelableId, labelIds: $labelIds }) { labelable { ... on Issue { number } } }
-}`,
-  /** #151: issue creation is GraphQL-only. CreateIssueInput carries no
-   *  labels at all, so creation can never trigger the REST auto-create-label
-   *  path (invariant 5); labels land afterwards via addLabels with
-   *  pre-resolved ids. */
-  createIssue: `mutation($repositoryId: ID!, $title: String!, $body: String!, $milestoneId: ID) {
-  createIssue(input: { repositoryId: $repositoryId, title: $title, body: $body, milestoneId: $milestoneId }) { issue { id number url } }
-}`,
-  /** #151 rollback: filing is all-or-nothing. GitHub cannot delete issues,
-   *  so a failed post-create write undoes itself by removing the board item
-   *  and closing the issue as not_planned. */
-  deleteProjectItem: `mutation($projectId: ID!, $itemId: ID!) {
-  deleteProjectV2ItemById(input: { projectId: $projectId, itemId: $itemId }) { deletedItemId }
-}`,
-  closeIssue: `mutation($id: ID!, $stateReason: IssueStateReason) {
-  updateIssue(input: { id: $id, state: CLOSED, stateReason: $stateReason }) { issue { number state } }
-}`,
-  /** #151 filing preflight: repository id + the FULL registered label
-   *  vocabulary (paginated) + the open milestone title → { id, number } map
-   *  — the number mapping is resolved at runtime, never hardcoded. */
-  repoVocabulary: `query($owner: String!, $repo: String!, $labelCursor: String) {
-  repository(owner: $owner, name: $repo) {
-    id
-    labels(first: 100, after: $labelCursor) { pageInfo { hasNextPage endCursor }
-      nodes { id name } }
-    milestones(first: 50, states: OPEN) { nodes { id number title } }
-  }
-}`,
-} as const;
 
 const ISSUE_FIELDS = `number
   milestone { title }
@@ -711,35 +671,39 @@ const ISSUE_FIELDS = `number
     priority: fieldValueByName(name: "Priority") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
   } }`;
 
+/** Result shape for the verification batch: one repository object whose keys
+ *  are the runtime-chosen aliases. The alias set is only known at call time,
+ *  so this document family cannot join the codegen set — `VerifyIssue`
+ *  mirrors the ISSUE_FIELDS selection by hand. */
+interface VerifyBatchResult {
+  repository: Record<string, VerifyIssue | null> | null;
+}
+
 /** Builds the per-batch verification query (aliased issue reads). */
-function verifyQuery(numbers: number[]): { query: string; aliases: string[] } {
+function verifyQuery(numbers: number[]): {
+  query: TypedDocumentNode<VerifyBatchResult, { owner: string; repo: string }>;
+  aliases: string[];
+} {
   const aliases = numbers.map((n) => `i${n}`);
   const body = numbers
     .map((n, i) => `    ${aliases[i]}: issue(number: ${n}) { ${ISSUE_FIELDS} }`)
     .join("\n");
-  const query = `query($owner: String!, $repo: String!) {\n  repository(owner: $owner, name: $repo) {\n${body}\n  }\n}`;
+  const query =
+    `query($owner: String!, $repo: String!) {\n  repository(owner: $owner, name: $repo) {\n${body}\n  }\n}` as TypedDocumentNode<
+      VerifyBatchResult,
+      { owner: string; repo: string }
+    >;
   return { query, aliases };
 }
 
-interface RawIssueNode {
-  id: string;
-  number: number;
-  title: string;
-  state: IssueState;
-  bodyText: string | null;
-  updatedAt: string;
-  closedAt?: string | null;
-  milestone: { title: string } | null;
-  labels: { nodes: { name: string }[] | null } | null;
-  blockedBy: { nodes: { number: number; state: IssueState; title: string }[] | null } | null;
-}
-
-interface RawBoardItem {
-  id: string;
-  status: { name: string } | null;
-  priority: { name: string } | null;
-  content: ({ __typename: string } & Partial<RawIssueNode>) | null;
-}
+/** Raw selection shapes, straight from the generated Snapshot types (#4):
+ *  the non-null element of the (nullable, null-item) issue/item lists. */
+type RawIssueNode = NonNullable<
+  NonNullable<NonNullable<SnapshotQuery["repository"]>["issues"]>["nodes"]
+>[number];
+type RawBoardItem = NonNullable<
+  NonNullable<NonNullable<SnapshotQuery["project"]>["items"]>["nodes"]
+>[number];
 
 // ---------------------------------------------------------------------------
 // Pure core — predicate, diff, cascade, packets (transliterated from
@@ -792,6 +756,7 @@ function budgetOf(body: string): { source: "body" | "skeleton"; line: string } {
 }
 
 const REPO_DIR = REPO.split("/")[1] ?? REPO;
+const REPO_OWNER = REPO.split("/")[0] ?? REPO;
 
 /** Worktree-root seam (#396): herdr's convention by default; PM_WORKTREE_ROOT
  *  re-points dispatchPackets (packet text) and lane()'s `git worktree add`
@@ -2275,12 +2240,6 @@ export function acceptanceFaceOf(body: string): AcceptanceFace {
 const SURFACE_EVIDENCE_PATTERN =
   /console|截图|screenshot|\.(?:png|jpe?g|webp|gif)\b|选择器断言|selector|对账|api[\s-]*face|\bCDP\b/i;
 
-const CLOSEOUT_TICKET_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    issue(number: $number) { title bodyText labels(first: 50) { nodes { name } } }
-  }
-}`;
-
 interface CloseoutTicketFacts {
   title: string;
   body: string;
@@ -2291,10 +2250,10 @@ interface CloseoutTicketFacts {
  *  caller's summary. Fail-closed: a ticket the gate cannot read is a ticket
  *  it cannot classify, and an unclassifiable closeout is the #362 复盘. */
 async function fetchCloseoutTicket(number: number): Promise<CloseoutTicketFacts> {
-  let data: Record<string, unknown>;
+  let data: CloseoutTicketQuery;
   try {
-    data = await gql(CLOSEOUT_TICKET_QUERY, {
-      owner: REPO.split("/")[0],
+    data = await gql(CloseoutTicketDocument, {
+      owner: REPO_OWNER,
       repo: REPO_DIR,
       number,
     });
@@ -2305,18 +2264,14 @@ async function fetchCloseoutTicket(number: number): Promise<CloseoutTicketFacts>
         `retry, or inject opts.ticket for offline flows`,
     );
   }
-  const issue = (
-    data.repository as
-      | { issue: { title: string; bodyText: string | null; labels: { nodes: { name: string }[] | null } | null } | null }
-      | null
-  )?.issue;
-  if (issue === null || issue === undefined) {
+  const issue = data.repository?.issue ?? null;
+  if (issue === null) {
     throw new Error(`AP.closeout: ticket #${number} not found on ${REPO} — wrong number?`);
   }
   return {
     title: issue.title,
     body: issue.bodyText ?? "",
-    labels: issue.labels?.nodes?.map((l) => l.name) ?? [],
+    labels: (issue.labels?.nodes ?? []).flatMap((l) => (l === null ? [] : [l.name])),
   };
 }
 
@@ -3300,7 +3255,7 @@ function vocabNameOf<V extends readonly string[]>(value: unknown, vocab: V): V[n
   return name;
 }
 
-function rawToTicket(raw: RawIssueNode): Ticket {
+function rawToTicket(raw: NonNullable<RawIssueNode>): Ticket {
   return {
     number: raw.number,
     id: raw.id,
@@ -3310,12 +3265,10 @@ function rawToTicket(raw: RawIssueNode): Ticket {
     updatedAt: raw.updatedAt,
     closedAt: raw.closedAt ?? null,
     milestone: raw.milestone?.title ?? null,
-    labels: (raw.labels?.nodes ?? []).map((l) => l.name),
-    blockedBy: (raw.blockedBy?.nodes ?? []).map((b) => ({
-      number: b.number,
-      state: b.state,
-      title: b.title,
-    })),
+    labels: (raw.labels?.nodes ?? []).flatMap((l) => (l === null ? [] : [l.name])),
+    blockedBy: (raw.blockedBy?.nodes ?? []).flatMap((b) =>
+      b === null ? [] : [{ number: b.number, state: b.state, title: b.title }],
+    ),
     itemId: null,
     status: null,
     priority: null,
@@ -3333,26 +3286,22 @@ export async function snapshot(): Promise<Snapshot> {
   const MAX_PAGES = 20; // guard ceiling: 20 × 100 ≫ board size; flags truncation
 
   for (let page = 0; page < MAX_PAGES && !(itemsDone && issuesDone); page += 1) {
-    const data = await gql(TEMPLATES.snapshot, {
+    // Annotated: without it, the cursor shorthand's loop-narrowing circles
+    // through this very initializer (TS7022).
+    const data: SnapshotQuery = await gql(SnapshotDocument, {
       id: PROJECT_ID,
-      owner: REPO.split("/")[0],
+      owner: REPO_OWNER,
       repo: REPO_DIR,
       itemCursor,
       issueCursor,
     });
-    const project = data.project as {
-      items: {
-        pageInfo: { hasNextPage: boolean; endCursor: string | null };
-        nodes: RawBoardItem[];
-      };
-    } | null;
-    if (project !== null) {
-      for (const item of project.items.nodes) {
+    const project = data.project;
+    if (project !== null && project.items !== undefined) {
+      for (const item of project.items.nodes ?? []) {
+        if (item === null) continue;
         const content = item.content;
-        if (content?.__typename !== "Issue" || content.number === undefined) {
-          continue;
-        }
-        const ticket = rawToTicket(content as RawIssueNode);
+        if (content === null || content.__typename !== "Issue") continue;
+        const ticket = rawToTicket(content);
         ticket.itemId = item.id;
         ticket.status = vocabNameOf(item.status, STATUS_OPTIONS);
         ticket.priority = vocabNameOf(item.priority, PRIORITY_OPTIONS);
@@ -3363,14 +3312,10 @@ export async function snapshot(): Promise<Snapshot> {
     } else {
       itemsDone = true;
     }
-    const repository = data.repository as {
-      issues: {
-        pageInfo: { hasNextPage: boolean; endCursor: string | null };
-        nodes: RawIssueNode[];
-      };
-    } | null;
-    if (repository !== null) {
-      for (const raw of repository.issues.nodes) {
+    const repository = data.repository;
+    if (repository !== null && repository.issues !== undefined) {
+      for (const raw of repository.issues.nodes ?? []) {
+        if (raw === null) continue;
         if (!tickets.has(raw.number)) tickets.set(raw.number, rawToTicket(raw));
       }
       issuesDone = !repository.issues.pageInfo.hasNextPage;
@@ -3389,23 +3334,26 @@ export async function snapshot(): Promise<Snapshot> {
   };
 }
 
-interface FieldsShape {
-  fields: {
-    nodes: ({ id: string; name: string; options: { id: string; name: string }[] } | null)[];
-  };
-}
-
 /** Runtime field/option resolution — option ids are NEVER hardcoded. */
+/** Single-select field shape as generated for ProjectFieldsQuery; the raw
+ *  node type unions in `Record<PropertyKey, never>` for the non-SingleSelect
+ *  members of ProjectV2Field, so the find sites need this named guard. */
+type SingleSelectField = { id: string; name: string; options: { id: string; name: string }[] };
+
 async function resolveSingleSelects(): Promise<{
   statusFieldId: string;
   priorityFieldId: string;
   statusOptions: Record<string, string>;
   priorityOptions: Record<string, string>;
 }> {
-  const data = await gql(TEMPLATES.fields, { id: PROJECT_ID });
-  const nodes = (data.node as FieldsShape | null)?.fields.nodes.filter(Boolean) ?? [];
-  const status = nodes.find((f) => f?.name === "Status");
-  const priority = nodes.find((f) => f?.name === "Priority");
+  const data = await gql(ProjectFieldsDocument, { id: PROJECT_ID });
+  const nodes = (data.node?.fields.nodes ?? []).flatMap((f) => (f === null ? [] : [f]));
+  const status = nodes.find(
+    (f): f is SingleSelectField => f !== null && "options" in f && f.name === "Status",
+  );
+  const priority = nodes.find(
+    (f): f is SingleSelectField => f !== null && "options" in f && f.name === "Priority",
+  );
   if (status === undefined || status === null) throw new Error("Status field not found on project");
   if (priority === undefined || priority === null)
     throw new Error("Priority field not found on project");
@@ -3417,14 +3365,6 @@ async function resolveSingleSelects(): Promise<{
     statusOptions: toMap(status),
     priorityOptions: toMap(priority),
   };
-}
-
-interface RefsShape {
-  repository: {
-    issue: { id: string } | null;
-    label: { id: string; name: string } | null;
-    milestones: { nodes: { id: string; title: string }[] };
-  } | null;
 }
 
 /**
@@ -3446,35 +3386,36 @@ export async function preflight(mutations: readonly Mutation[]): Promise<Preflig
 
   const labels: Record<string, string> = {};
   for (const name of needLabels) {
-    const data = await gql(
-      `query($owner: String!, $repo: String!, $name: String!) { repository(owner: $owner, name: $repo) { label(name: $name) { id name } } }`,
-      { owner: REPO.split("/")[0], repo: REPO_DIR, name },
-    );
-    const label = (data.repository as RefsShape["repository"])?.label;
-    if (label !== null && label !== undefined) labels[label.name] = label.id;
+    const data = await gql(RepoLabelIdDocument, {
+      owner: REPO_OWNER,
+      repo: REPO_DIR,
+      name,
+    });
+    const label = data.repository?.label ?? null;
+    if (label !== null) labels[label.name] = label.id;
   }
 
   let milestones: Record<string, string> = {};
   const extraIssueIds: Record<number, string> = {};
   const needsMilestones = mutations.some((m) => m.op === "setMilestone");
   if (needsMilestones || unresolvedBlockers.length > 0) {
-    const data = await gql(
-      `query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { milestones(first: 50, states: OPEN) { nodes { id title } } } }`,
-      { owner: REPO.split("/")[0], repo: REPO_DIR },
-    );
+    const data = await gql(RepoOpenMilestonesDocument, {
+      owner: REPO_OWNER,
+      repo: REPO_DIR,
+    });
     milestones = Object.fromEntries(
-      ((data.repository as RefsShape["repository"])?.milestones.nodes ?? []).map((m) => [
-        m.title,
-        m.id,
-      ]),
+      (data.repository?.milestones?.nodes ?? []).flatMap((m) =>
+        m === null ? [] : [[m.title, m.id] as const],
+      ),
     );
   }
   for (const n of unresolvedBlockers) {
-    const data = await gql(
-      `query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { issue(number: $number) { id } } }`,
-      { owner: REPO.split("/")[0], repo: REPO_DIR, number: n },
-    );
-    const id = (data.repository as RefsShape["repository"])?.issue?.id;
+    const data = await gql(IssueNodeIdDocument, {
+      owner: REPO_OWNER,
+      repo: REPO_DIR,
+      number: n,
+    });
+    const id = data.repository?.issue?.id;
     if (typeof id === "string" && id !== "") extraIssueIds[n] = id;
   }
 
@@ -3518,22 +3459,12 @@ function batchOps(ops: readonly ResolvedOp[]): ResolvedOp[][] {
 async function execOp(op: ResolvedOp, itemIds: Map<number, string>): Promise<void> {
   switch (op.kind) {
     case "addProjectItem": {
-      const data = await gql(TEMPLATES.addProjectItem, {
+      const data = await gql(AddProjectItemDocument, {
         projectId: PROJECT_ID,
         contentId: op.issueNodeId,
       });
-      const payload = data.addProjectV2ItemById;
-      if (payload !== null && typeof payload === "object" && "item" in payload) {
-        const item = payload.item;
-        if (
-          item !== null &&
-          typeof item === "object" &&
-          "id" in item &&
-          typeof item.id === "string"
-        ) {
-          itemIds.set(op.number, item.id);
-        }
-      }
+      const created = data.addProjectV2ItemById?.item?.id;
+      if (created !== null && created !== undefined) itemIds.set(op.number, created);
       return;
     }
     case "setStatus":
@@ -3544,7 +3475,7 @@ async function execOp(op: ResolvedOp, itemIds: Map<number, string>): Promise<voi
           `#${op.number}: ${op.kind} without a board item — addProjectItem must run first`,
         );
       }
-      await gql(TEMPLATES.setSingleSelect, {
+      await gql(SetSingleSelectDocument, {
         projectId: PROJECT_ID,
         itemId,
         fieldId: op.fieldId,
@@ -3553,16 +3484,16 @@ async function execOp(op: ResolvedOp, itemIds: Map<number, string>): Promise<voi
       return;
     }
     case "setMilestone":
-      await gql(TEMPLATES.setMilestone, { id: op.issueNodeId, milestoneId: op.milestoneId });
+      await gql(SetMilestoneDocument, { id: op.issueNodeId, milestoneId: op.milestoneId });
       return;
     case "addBlockedBy":
-      await gql(TEMPLATES.addBlockedBy, {
+      await gql(AddBlockedByDocument, {
         issueId: op.issueNodeId,
         blockingIssueId: op.blockerNodeId,
       });
       return;
     case "addLabels":
-      await gql(TEMPLATES.addLabels, { labelableId: op.issueNodeId, labelIds: op.labelIds });
+      await gql(AddLabelsDocument, { labelableId: op.issueNodeId, labelIds: op.labelIds });
       return;
   }
 }
@@ -3585,15 +3516,15 @@ interface VerifyIssue {
 async function verifyBatch(batch: readonly ResolvedOp[]): Promise<string[]> {
   const numbers = [...new Set(batch.map((op) => op.number))];
   const { query, aliases } = verifyQuery(numbers);
-  const data = await gql(query, { owner: REPO.split("/")[0], repo: REPO_DIR });
-  const repo = (data.repository as RefsShape["repository"] | null) ?? null;
+  const data = await gql(query, { owner: REPO_OWNER, repo: REPO_DIR });
+  const repo = data.repository;
   if (repo === null) return ["verification query returned no repository"];
   const errors: string[] = [];
   const byAlias = new Map<string, VerifyIssue | null>();
   for (let i = 0; i < numbers.length; i += 1) {
     const key = aliases[i];
     if (key !== undefined)
-      byAlias.set(key, (repo as unknown as Record<string, VerifyIssue | null>)[key] ?? null);
+      byAlias.set(key, repo[key] ?? null);
   }
   for (const op of batch) {
     const issue = byAlias.get(`i${op.number}`) ?? null;
@@ -3746,15 +3677,6 @@ export async function cascade(
   return report;
 }
 
-interface VocabRepository {
-  id: string;
-  labels: {
-    pageInfo: { hasNextPage: boolean; endCursor: string | null };
-    nodes: { id: string; name: string }[];
-  };
-  milestones: { nodes: { id: string; number: number; title: string }[] };
-}
-
 /**
  * #151 all-or-nothing rollback for a confirmed filing that failed after
  * creation. GitHub cannot delete issues, so the undo is: remove the board
@@ -3771,7 +3693,7 @@ async function rollbackFiling(
   const itemId = itemIds.get(issue.number);
   if (itemId !== undefined) {
     try {
-      await gql(TEMPLATES.deleteProjectItem, { projectId: PROJECT_ID, itemId });
+      await gql(DeleteProjectItemDocument, { projectId: PROJECT_ID, itemId });
       steps.push(`board item ${itemId} removed`);
     } catch (err) {
       failures.push(
@@ -3780,7 +3702,7 @@ async function rollbackFiling(
     }
   }
   try {
-    await gql(TEMPLATES.closeIssue, { id: issue.id, stateReason: "NOT_PLANNED" });
+    await gql(CloseIssueDocument, { issueId: issue.id, stateReason: "NOT_PLANNED" });
     steps.push("issue closed as not_planned");
   } catch (err) {
     failures.push(`close failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3831,12 +3753,10 @@ async function verifyFiling(
   vocabulary: Set<string>,
 ): Promise<string[]> {
   const { query, aliases } = verifyQuery([number]);
-  const data = await gql(query, { owner: REPO.split("/")[0], repo: REPO_DIR });
-  const repo = (data.repository as RefsShape["repository"] | null) ?? null;
+  const data = await gql(query, { owner: REPO_OWNER, repo: REPO_DIR });
+  const repo = data.repository;
   const issue =
-    repo === null
-      ? null
-      : ((repo as unknown as Record<string, VerifyIssue | null>)[aliases[0] ?? ""] ?? null);
+    repo === null ? null : (repo[aliases[0] ?? ""] ?? null);
   if (issue === null) return [`#${number}: not readable at post-filing verification`];
   const errors: string[] = [];
   const readLabels = (issue.labels?.nodes ?? []).map((l) => l.name);
@@ -3918,7 +3838,7 @@ export async function file(spec: FileSpec, opts: { confirm?: boolean } = {}): Pr
   const { plan: derived, pmReview, explicitDims } = planFile(spec, cls);
   const errors: string[] = [];
   const plan: FilePlan = { ...derived, milestoneNumber: null };
-  const owner = REPO.split("/")[0];
+  const owner = REPO_OWNER;
 
   // Runtime resolution: full label vocabulary + open milestones (id + number)
   // + Status/Priority field option ids. Reads only — legal in dry-run.
@@ -3928,23 +3848,29 @@ export async function file(spec: FileSpec, opts: { confirm?: boolean } = {}): Pr
   let milestoneRef: { id: string; number: number } | null = null;
   let labelCursor: string | null = null;
   for (let page = 0; page < 5; page += 1) {
-    const data = await gql(TEMPLATES.repoVocabulary, { owner, repo: REPO_DIR, labelCursor });
-    const repo = (data.repository as VocabRepository | null) ?? null;
+    // Annotated: same TS7022 loop-circle as in snapshot() (labelCursor).
+    const data: RepoVocabularyQuery = await gql(RepoVocabularyDocument, {
+      owner,
+      repo: REPO_DIR,
+      labelCursor,
+    });
+    const repo = data.repository;
     if (repo === null) {
       errors.push("repository not readable — vocabulary resolution failed");
       break;
     }
     repoId = repo.id;
-    for (const l of repo.labels.nodes) {
+    for (const l of repo.labels?.nodes ?? []) {
+      if (l === null) continue;
       labelIds[l.name] = l.id;
       vocabulary.add(l.name);
     }
     if (plan.milestone !== null) {
-      const m = repo.milestones.nodes.find((n) => n.title === plan.milestone);
-      if (m !== undefined) milestoneRef = { id: m.id, number: m.number };
+      const m = repo.milestones?.nodes?.find((n) => n !== null && n.title === plan.milestone);
+      if (m !== undefined && m !== null) milestoneRef = { id: m.id, number: m.number };
     }
-    if (!repo.labels.pageInfo.hasNextPage) break;
-    labelCursor = repo.labels.pageInfo.endCursor;
+    if (!repo.labels?.pageInfo.hasNextPage) break;
+    labelCursor = repo.labels.pageInfo.endCursor ?? null;
   }
   if (plan.milestone !== null && milestoneRef === null) {
     errors.push(
@@ -3988,11 +3914,8 @@ export async function file(spec: FileSpec, opts: { confirm?: boolean } = {}): Pr
   // Blocker node ids (dependency axis; edges are the only cross-issue write).
   const blockerIds: Record<number, string> = {};
   for (const n of plan.blockedBy) {
-    const data = await gql(
-      `query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { issue(number: $number) { id } } }`,
-      { owner, repo: REPO_DIR, number: n },
-    );
-    const id = (data.repository as RefsShape["repository"] | null)?.issue?.id;
+    const data = await gql(IssueNodeIdDocument, { owner, repo: REPO_DIR, number: n });
+    const id = data.repository?.issue?.id;
     if (typeof id !== "string" || id === "") {
       errors.push(`#${n}: blocker not found — cannot wire an edge to a nonexistent issue`);
     } else {
@@ -4020,16 +3943,16 @@ export async function file(spec: FileSpec, opts: { confirm?: boolean } = {}): Pr
   // Confirmed path. Creation first (GraphQL carries no labels — invariant 5),
   // then labels by pre-resolved id, then board/field/edge ops via the same
   // batched exec path AP.apply uses.
-  const createData = await gql(TEMPLATES.createIssue, {
+  if (repoId === null) {
+    throw new Error("AP.file: repository id lost between guard and write");
+  }
+  const createData = await gql(CreateIssueDocument, {
     repositoryId: repoId,
     title: spec.title,
     body: spec.body,
     milestoneId: milestoneRef?.id ?? null,
   });
-  const payload = createData.createIssue as {
-    issue: { id: string; number: number; url: string | null } | null;
-  } | null;
-  const issue = payload?.issue ?? null;
+  const issue = createData.createIssue?.issue ?? null;
   if (issue === null) throw new Error("AP.file: createIssue returned no issue");
 
   const itemIds = new Map<number, string>();
@@ -4042,7 +3965,7 @@ export async function file(spec: FileSpec, opts: { confirm?: boolean } = {}): Pr
         if (id === undefined) throw new Error(`AP.file: label ${l} lost between guard and write`);
         ids.push(id);
       }
-      await gql(TEMPLATES.addLabels, { labelableId: issue.id, labelIds: ids });
+      await gql(AddLabelsDocument, { labelableId: issue.id, labelIds: ids });
     }
 
     const ops: ResolvedOp[] = [

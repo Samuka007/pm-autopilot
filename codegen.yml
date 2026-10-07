@@ -1,0 +1,42 @@
+# #4 — codegen-typed GraphQL documents. Schema = the vendored live-API SDL
+# (src/graphql/schema.graphql, refreshed via pnpm schema:sync — the
+# @octokit/graphql-schema snapshot went stale in 2025-11 and no published
+# version carries the issue-dependencies axis the templates use; a committed
+# local file keeps codegen and CI offline either way). Documents are plucked
+# from src/graphql/documents.ts (leading /* GraphQL */ comment).
+# Generated artifacts are COMMITTED; CI gates drift: pnpm codegen &&
+# git diff --exit-code -- src/generated.
+schema: "./src/graphql/schema.graphql"
+documents:
+  - "src/graphql/documents.ts"
+generates:
+  src/generated/graphql-schema.ts:
+    plugins:
+      - "typescript"
+    config:
+      enumsAsTypes: true
+      useTypeImports: true
+      scalars:
+        DateTime: string
+        PreciseDateTime: string
+        GitTimestamp: string
+        GitObjectID: string
+        URI: string
+        HTML: string
+  src/generated/graphql.ts:
+    plugins:
+      - "typescript-operations"
+    config:
+      # importSchemaTypesFrom is REQUIRED in a same-run multi-output setup:
+      # without it the operations plugin re-visits the schema and re-emits
+      # the enums/result inputs the base plugin already emitted (duplicate
+      # identifiers in one directory). Keep both scalar maps in lockstep.
+      importSchemaTypesFrom: "./src/generated/graphql-schema"
+      useTypeImports: true
+      scalars:
+        DateTime: string
+        PreciseDateTime: string
+        GitTimestamp: string
+        GitObjectID: string
+        URI: string
+        HTML: string
