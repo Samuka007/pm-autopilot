@@ -209,7 +209,6 @@
  * tracker-schema.md invariant 3).
  */
 
-import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -217,6 +216,7 @@ import { fileURLToPath } from "node:url";
 
 import type { RetryOptions } from "@octokit/plugin-retry";
 import type { ThrottlingOptions } from "@octokit/plugin-throttling";
+import { execaSync } from "execa";
 import { Octokit } from "octokit";
 
 import { validateWalkSpec, walk, walkVerdict } from "./walk.js";
@@ -477,11 +477,15 @@ export function _inject(deps: Partial<APDeps> | null): void {
 function resolveToken(): string {
   const fromEnv = process.env.GH_TOKEN;
   if (fromEnv !== undefined && fromEnv.length > 0) return fromEnv;
-  return execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim();
+  return execaSync("gh", ["auth", "token"]).stdout.trim();
 }
 
-const defaultRunGit = (args: string[], cwd: string): string =>
-  execFileSync("git", args, { cwd, encoding: "utf8" });
+/** #6: execa v9 with rejection on — a failing command throws an ExecaSyncError
+ *  carrying the full argv and stderr (execFileSync lost both). Exported for
+ *  the offline failure-surface test; the `injected.runGit` seam (same sync
+ *  signature) still wins wherever it is injected. */
+export const defaultRunGit = (args: string[], cwd: string): string =>
+  execaSync("git", args, { cwd }).stdout;
 
 function runGit(args: string[], cwd: string): string {
   const fn = injected?.runGit ?? defaultRunGit;
