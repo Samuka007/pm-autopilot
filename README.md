@@ -143,6 +143,35 @@ so long PM sessions never ride an expired Bearer.
 Required App permissions (no webhooks): `metadata: read`, `issues: write`,
 `projects: write` on the selected repositories.
 
+### Onboarding — one command, once per machine (#7)
+
+```sh
+node scripts/onboard_github_app.mjs        # --force replaces a different App's store
+```
+
+Plain node, zero extra deps — it runs before the plugin itself is trusted
+infrastructure. The script:
+
+1. Prints the manifest URL
+   (`https://github.com/settings/apps/new?state=…`); open it and approve App
+   creation.
+2. GitHub redirects to a placeholder page ending in `?code=<code>` — paste
+   that code at the prompt (no local callback server involved).
+3. Exchanges the code for the App credentials and writes the **machine-level**
+   store `~/.config/pm-autopilot/credentials.json` (0600, dir 0700,
+   `XDG_CONFIG_HOME`-aware) with `app_id`, `private_key`,
+   `default_installation_id` — reused by every project; a run leaves git
+   status untouched.
+4. Verifies the write end to end by minting one installation token through
+   the written credentials and reporting success/failure (the PEM and tokens
+   are never printed).
+
+Re-running the script with the same App updates the store in place; a store
+belonging to a different App is only replaced with `--force`. *(User-level
+manual smoke: this flow touches github.com and your home directory — run it
+once yourself; the automated suite covers it offline with injected
+fetch/stream stubs.)*
+
 ## Quickstart — one PM turn
 
 ```js
