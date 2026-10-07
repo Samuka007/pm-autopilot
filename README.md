@@ -1,10 +1,10 @@
 # pm-autopilot
 
 PM state machine for agent fleets: **board-truth dispatch gates, guarded board
-writes, drift audit, resource leases, evidence-bound closeouts** — packaged as
-an omp custom-tool family (`pm_lane` / `pm_apply` / `pm_audit` / `pm_release` /
-`pm_ledger` / `pm_walk_ledger` / `pm_walk`) plus a `%load`-able AP core
-(`src/core.ts`) for the omp eval JS kernel.
+writes, drift audit, evidence-bound closeouts** — packaged as an omp
+custom-tool family (`pm_lane` / `pm_apply` / `pm_audit` / `pm_walk_ledger` /
+`pm_walk`) plus a `%load`-able AP core (`src/core.ts`) for the omp eval JS
+kernel.
 
 Extracted verbatim from `Samuka007/cloudflare-agent-project` `plugins/pm-harness`
 (#396), carrying the full lineage #131 → #270 → #277 → #299 → #391 → #392 →
@@ -19,10 +19,13 @@ turn and keeps zero resident state.
 | `pm_lane` | `AP.lane` | Gate check (open ∧ Todo ∧ no open blockers) → worktree provision → lane spawn → `blockedBy` edges materialized with the dispatch (#393) → guarded board flip to In Progress. Dry-run default. |
 | `pm_apply` | `AP.apply` | The ONLY board write path: preflight diff → batched guarded writes with per-batch re-verify; drift withholds remaining batches. Dry-run default. |
 | `pm_audit` | `AP.audit` | Board-vs-reality drift reconcile (read-only); walk-due rule 8 always armed from the repo ledger; prose dependencies without a `blockedBy` edge (#393, rule 9, advisory); returns `pm_apply`-ready repair mutations. |
-| `pm_release` | `AP.release` | Browser-lease release (CDP tab/thread discipline) in the append-only ledger. |
-| `pm_ledger` | `AP.ledger` | Lease ledger read: full event log + replayed active set. |
 | `pm_walk_ledger` | `AP.walkDue` / `AP.walkDone` / `AP.walkLedger` | 走查挂账 ledger (#391): register {ticket, due, face}, settle with evidence, read events + active set. Overdue = audit rule 8 → board flips red (Wait for user). |
 | `pm_walk` | `AP.walk` | Acceptance probe (#392): walks a real page — console/page errors, failed requests, selector assertions, screenshot — and writes `.pm-walk/` evidence with a sha256 anchor for the `source:walk` closeout gate (#390). Read-only against the board. |
+
+Retired (#460, user ruling 2026-10-07): the #240 browser-lease ledger and its
+tool pair (`pm_release` / `pm_ledger`), audit rule 6, and `AP.lane`'s
+auto-lease — per-agent headless browsers left nothing to contend for.
+`.pm-leases.jsonl` survives only as a frozen historical ledger.
 
 Bundles one task-agent def: `agents/pm-guard.md` (board guardian; same
 guarded-write discipline).
@@ -37,7 +40,7 @@ omp plugin link /path/to/pm-autopilot
 omp plugin list
 ```
 
-In any omp session the seven tools are then discoverable without any import —
+In any omp session the five tools are then discoverable without any import —
 model-callable directly, callable from the eval kernel as
 `await tool.pm_lane(310, {}, { confirm: true })`, or mounted as `xd://pm_*`
 under `tools.xdev`.
@@ -65,9 +68,8 @@ minimum `PM_REPO` + `PM_PROJECT_ID`.
 | `PM_REPO` | `Samuka007/cloudflare-agent-project` | `owner/name` of the audited repo + board. Also injected into the jev classify prompt (#396 — the prompt names YOUR repo, no hardcoding). |
 | `PM_PROJECT_ID` | `PVT_kwHOAvgCqs4Blk19` | GitHub Projects V2 GraphQL id. Field/option ids are ALWAYS resolved live at runtime — only this container id is configured. |
 | `GH_TOKEN` | `gh auth token` fallback | GitHub token for GraphQL reads/writes. |
-| `JEV_API_KEY` | gitignored `.env.local` at the repo root | Judge (intake/file classification) only — the seven tools never touch jev. Real-call smoke skips itself without a key. |
+| `JEV_API_KEY` | gitignored `.env.local` at the repo root | Judge (intake/file classification) only — the five tools never touch jev. Real-call smoke skips itself without a key. |
 | `PM_WORKTREE_ROOT` | `~/.herdr/worktrees` | Worktree-root seam (#396): re-points packet paths AND `AP.lane`'s `git worktree add` target at a non-herdr provisioning backend without code changes. |
-| `PM_LEASES_PATH` | `.pm-leases.jsonl` at the package root | Browser-lease ledger (append-only, gitignored). |
 | `PM_CLOSEOUTS_PATH` | `.pm-closeouts.jsonl` at the package root | Closeout evidence ledger. |
 | `PM_WALKS_PATH` | `.pm-walks.jsonl` at the package root | Walk-deferral (走查挂账) ledger. |
 | `PM_LANE_NO_DETACH` | unset | `=1` disables the detached-omp spawn fallback, restoring the transport-missing contract. |
@@ -141,9 +143,8 @@ pm-guard agent def encodes exactly this discipline.
 - **Evidence-bound closeouts.** The closeout gate rejects `source:ci` for
   product-surface acceptance (#390); UI evidence must carry a `pm_walk` report
   anchor (`.pm-walk/…/report.json` + sha256).
-- **Append-only ledgers, gitignored.** Leases, closeouts, and walk deferrals
-  live in `.pm-*.jsonl` files that are never committed; lease discipline
-  (named tab + thread prefix + release obligation) is enforced at dispatch.
+- **Append-only ledgers, gitignored.** Closeouts and walk deferrals live in
+  `.pm-*.jsonl` files that are never committed.
 - **No secrets in code.** `GH_TOKEN` / `JEV_API_KEY` come from env or a
   gitignored `.env.local`. Judge replies classify only — nothing auto-writes;
   the gate decides who reads the result.
@@ -192,7 +193,7 @@ pm-autopilot/
   package.json        # omp manifest: tools → ./src/tools.ts
   src/core.ts         # AP core (#131, relocated #270, extracted #396)
   src/walk.ts         # AP.walk probe surface (#392): facade → raw-CDP → fetch
-  src/tools.ts        # the seven custom tools + detached-omp fallback
+  src/tools.ts        # the five custom tools + detached-omp fallback
   src/host-types.ts   # structural omp CustomToolAPI types (no omp dep needed)
   agents/pm-guard.md  # task-agent def (board guardian)
   test/               # L1: core / tools / walk suites + shared fixtures
