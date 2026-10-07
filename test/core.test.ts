@@ -1547,7 +1547,9 @@ describe("AP.lane (runGit seam — zero filesystem side effects)", () => {
     expect(rep.ok).toBe(true);
     expect(rep.worktreeCreated).toBe(true);
     expect(rep.spawned).toBe(true);
-    expect(gitCalls).toHaveLength(1);
+    // #456: provision = worktree add + submodule init, in that order, the
+    // init running INSIDE the new tree.
+    expect(gitCalls).toHaveLength(2);
     expect(gitCalls[0]?.args).toEqual([
       "worktree",
       "add",
@@ -1556,6 +1558,9 @@ describe("AP.lane (runGit seam — zero filesystem side effects)", () => {
       "lane/200-feat-demo-lane",
       "origin/main",
     ]);
+    expect(gitCalls[1]?.args).toEqual(["submodule", "update", "--init"]);
+    // the init runs INSIDE the fresh tree, not the dispatching repo
+    expect(gitCalls[1]?.cwd).toBe(gitCalls[0]?.args[2]);
     expect(rep.spawn).toMatchObject({
       agent: "task",
       isolated: true,
@@ -1574,6 +1579,29 @@ describe("AP.lane (runGit seam — zero filesystem side effects)", () => {
     expect(rep.worktreeCreated).toBe(false);
     expect(rep.errors[0]).toContain("git worktree add failed");
     expect(rep.errors[0]).toContain("already exists");
+  });
+
+  it("#456: submodule init failure aborts the dispatch — worktree kept, no spawn, no flip", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const board = laneBoard(200);
+    _inject({
+      gql: board.gql,
+      runGit: (args) => {
+        if (args[0] === "submodule") {
+          throw new Error("fatal: could not read Username for 'https://github.com'");
+        }
+        return "";
+      },
+    });
+    registerSpawn(() => "L200demo");
+    const rep = await lane(laneTicket(), {}, { confirm: true });
+    logSpy.mockRestore();
+    expect(rep.ok).toBe(false);
+    expect(rep.worktreeCreated).toBe(true);
+    expect(rep.spawned).toBe(false);
+    expect(rep.errors[0]).toContain("git submodule update --init failed");
+    // a half-provisioned tree never spawns a lane or touches the board
+    expect(board.items.find((i) => i.issueNumber === 200)?.status).toBe("Todo");
   });
 
   // #199: dual entry. A number self-resolves through the snapshot seam and
@@ -1660,7 +1688,7 @@ describe("AP.lane spawn transport (#206)", () => {
     expect(seen[0]?.agent).toBe("task");
     expect(seen[0]?.context).toBe("# Contract\nshared interfaces");
     expect(seen[0]?.prompt).toBe(rep.spawn?.task); // the full packet context IS the lane task
-    expect(gitCalls).toHaveLength(1); // worktree provisioning still happens
+    expect(gitCalls).toHaveLength(2); // worktree add + submodule init (#456)
   });
 
   it("confirm owns the board flip: Status → In Progress through the guarded write, after the spawn", async () => {
@@ -1768,7 +1796,8 @@ describe("AP.lane spawn transport (#206)", () => {
     ]);
     expect(reps.every((r) => r.worktreeCreated)).toBe(true);
     expect(reps.every((r) => r.statusFlipped)).toBe(true);
-    expect(gitArgs).toHaveLength(2); // one worktree add per ticket
+    expect(gitArgs).toHaveLength(4); // per ticket: worktree add + submodule init (#456)
+    expect(gitArgs.filter((a) => a[0] === "submodule")).toHaveLength(2);
   });
 
   it("batch dry-run plans every ticket and touches nothing; dry-run/refused reports carry null transport fields", async () => {
