@@ -215,6 +215,10 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import type { RetryOptions } from "@octokit/plugin-retry";
+import type { ThrottlingOptions } from "@octokit/plugin-throttling";
+import { Octokit } from "octokit";
+
 import { validateWalkSpec, walk, walkVerdict } from "./walk.js";
 
 export type {
@@ -484,31 +488,54 @@ function runGit(args: string[], cwd: string): string {
   return fn(args, cwd);
 }
 
-const defaultGql: GqlFn = async (query, variables) => {
+/** Octokit-backed transport factory (#3, ADR-0001). The composed `octokit`
+ *  client already wires @octokit/plugin-retry + @octokit/plugin-throttling
+ *  (octokit@5 ≡ @octokit/core.plugin(rest, paginate, retry, throttling));
+ *  re-wrapping them here would stack duplicate request hooks, so the factory
+ *  only pins the policy: 3× exponential retries (plugin default), standard
+ *  onRateLimit / onSecondaryRateLimit handlers spending the same 3-retry
+ *  budget. `fetch?` lets unit tests drive the REAL Octokit path against a
+ *  stub — the `_inject({ gql })` seam stays authoritative for offline runs. */
+export function makeGql(fetch?: FetchFn): GqlFn {
   const token = resolveToken();
-  const response = await fetch("https://api.github.com/graphql", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      "user-agent": "pm-autopilot (#131)",
+  const octokit = new Octokit({
+    userAgent: "pm-autopilot (#131)",
+    retry: { retries: 3 },
+    throttle: {
+      onRateLimit: (_retryAfter, options, octo, retryCount) => {
+        octo.log.warn(`Request quota exhausted for ${options.method} ${options.url}`);
+        return retryCount < 3;
+      },
+      onSecondaryRateLimit: (_retryAfter, options, octo, retryCount) => {
+        octo.log.warn(`Secondary rate limit for ${options.method} ${options.url}`);
+        return retryCount < 3;
+      },
     },
-    body: JSON.stringify({ query, variables }),
+    ...(fetch === undefined ? {} : { request: { fetch } }),
   });
-  if (!response.ok) {
-    throw new Error(`GraphQL transport ${String(response.status)}: ${await response.text()}`);
-  }
-  const payload = (await response.json()) as {
-    data?: Record<string, unknown> | null;
-    errors?: { message: string }[];
+  return async (query, variables) => {
+    // Bearer prefix per request: `auth: <token>` emits `token <t>` for PATs
+    // (withAuthorizationPrefix) — today's wire format is `Bearer <t>`, and
+    // GitHub's GraphQL endpoint accepts the explicit header unchanged.
+    // `headers` is a reserved graphql option key, never a variable name.
+    const data = (await octokit.graphql(query, {
+      ...variables,
+      headers: { authorization: `Bearer ${token}` },
+    })) as Record<string, unknown> | null | undefined;
+    if (data === null || data === undefined) {
+      throw new Error("GraphQL response carried neither data nor errors");
+    }
+    return data;
   };
-  if (payload.errors !== undefined && payload.errors.length > 0) {
-    throw new Error(`GraphQL errors: ${payload.errors.map((e) => e.message).join("; ")}`);
-  }
-  if (payload.data === undefined || payload.data === null) {
-    throw new Error("GraphQL response carried neither data nor errors");
-  }
-  return payload.data;
+}
+
+let defaultGqlClient: GqlFn | null = null;
+const defaultGql: GqlFn = (query, variables) => {
+  // Lazy + memoized: token resolution (GH_TOKEN → `gh auth token`) must not
+  // run at module load (offline CI imports this file with neither present),
+  // and one Octokit client per process beats a token spawn per GraphQL call.
+  if (defaultGqlClient === null) defaultGqlClient = makeGql();
+  return defaultGqlClient(query, variables);
 };
 
 function gql(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
