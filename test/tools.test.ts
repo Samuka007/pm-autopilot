@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +7,6 @@ import {
   _spawnFallbackInstalled,
   _inject,
   lane,
-  lease,
   registerSpawn,
   registerSpawnFallback,
   walkDue,
@@ -47,18 +46,16 @@ vi.mock("node:child_process", () => ({
 /**
  * L1 for the #270 custom-tool family (plugins/pm-harness/src/tools.ts). Same
  * discipline as core.test.ts: zero network — the GitHub transport is the
- * shared in-memory MockBoard, git is an injected recorder, and the lease
- * ledger runs on a real tmp file (this file does NOT mock node:fs, unlike
- * core.test.ts's wholesale mock — the tools' ledger/release path exercises
- * real fs on tmp).
+ * shared in-memory MockBoard and git is an injected recorder (this file does
+ * NOT mock node:fs, unlike core.test.ts's wholesale mock).
  *
- * Covered: factory surface (six discoverable tools), pm_apply preflight
+ * Covered: factory surface (five discoverable tools), pm_apply preflight
  * rejection of closed-state drift + guarded write + per-batch verify-drift
  * refusal, pm_audit → pm_apply reconcile loop, pm_lane dry-run/refusal/
  * confirm dispatch through the registered transport, the #270 detached-omp
  * fallback ladder (unit + factory-install + lane-level + PM_LANE_NO_DETACH
- * escape hatch), the pm_release/pm_ledger ledger pair, and the pm_walk
- * 走查挂账 ledger + pm_audit's always-armed rule 8 (#391).
+ * escape hatch), and the pm_walk 走查挂账 ledger + pm_audit's always-armed
+ * rule 8 (#391).
  */
 
 // ---------------------------------------------------------------------------
@@ -160,14 +157,12 @@ function seedBoard(): MockBoard {
 // ---------------------------------------------------------------------------
 
 describe("pm-harness tools factory (#270)", () => {
-  it("registers exactly the six tools under stable names", () => {
+  it("registers exactly the five tools under stable names", () => {
     const tools = createPmHarnessTools(fakeApi());
     expect(tools.map((t) => t.name)).toEqual([
       "pm_lane",
       "pm_apply",
       "pm_audit",
-      "pm_release",
-      "pm_ledger",
       "pm_walk_ledger",
       "pm_walk",
     ]);
@@ -177,6 +172,12 @@ describe("pm-harness tools factory (#270)", () => {
       expect(t.parameters).toBeDefined();
       expect(typeof t.execute).toBe("function");
     }
+  });
+
+  it("board fixture vocabulary stays anchored", () => {
+    expect(Object.keys(LABEL_IDS)).toContain("ready-for-human");
+    expect(STATUS_FIELD_ID).toBe("F_status");
+    expect(PRIORITY_FIELD_ID).toBe("F_priority");
   });
 });
 
@@ -516,86 +517,6 @@ describe("detached-omp spawn fallback", () => {
     expect(report.spawned).toBe(false);
     expect(report.ok).toBe(false);
     expect(report.spawnError).toContain("PM_LANE_NO_DETACH");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// pm_release / pm_ledger — the lease pair (real tmp-file ledger)
-// ---------------------------------------------------------------------------
-
-describe("pm_release + pm_ledger tools", () => {
-  const tmpRoot = mkdtempSync(join(tmpdir(), "pm-ledger-"));
-
-  afterEach(() => {
-    _inject(null);
-  });
-
-  it("release closes an active lease; ledger replays events and the active set", async () => {
-    const ledgerPath = join(tmpRoot, "release-case.jsonl");
-    rmSync(ledgerPath, { force: true });
-    lease(
-      "browser",
-      { lane: "lane-310-x", tabName: "l310", threadPrefix: "l310-", number: 310 },
-      { path: ledgerPath },
-    );
-    const api = fakeApi();
-    const releaseTool = toolByName(createPmHarnessTools(api), "pm_release");
-    const ledgerTool = toolByName(createPmHarnessTools(api), "pm_ledger");
-
-    const before = await callTool(ledgerTool, { leasesPath: ledgerPath });
-    const beforeDetails = toolDetails<{ events: unknown[]; active: unknown[] }>(before, ["events"]);
-    expect(beforeDetails.events.length).toBe(1);
-    expect(beforeDetails.active.length).toBe(1);
-
-    const released = await callTool(releaseTool, {
-      type: "browser",
-      lane: "lane-310-x",
-      leasesPath: ledgerPath,
-    });
-    expect(
-      toolDetails<{ releasedAt: string | null }>(released, ["releasedAt"]).releasedAt,
-    ).not.toBeNull();
-
-    const after = await callTool(ledgerTool, { leasesPath: ledgerPath });
-    const afterDetails = toolDetails<{ events: unknown[]; active: unknown[] }>(after, ["events"]);
-    expect(afterDetails.events.length).toBe(2);
-    expect(afterDetails.active).toEqual([]);
-
-    // Release without an active lease is a ledger bug — the tool surfaces it.
-    await expect(
-      callTool(releaseTool, { type: "browser", lane: "lane-310-x", leasesPath: ledgerPath }),
-    ).rejects.toThrow();
-  });
-
-  it("ledger tolerates a missing file (empty view, no fabrication)", async () => {
-    const ledgerTool = toolByName(createPmHarnessTools(fakeApi()), "pm_ledger");
-    const result = await callTool(ledgerTool, { leasesPath: join(tmpRoot, "absent.jsonl") });
-    expect(result.details).toEqual({ events: [], active: [] });
-  });
-
-  it("appends readable jsonl events at the overridden path", () => {
-    const ledgerPath = join(tmpRoot, "append-case.jsonl");
-    rmSync(ledgerPath, { force: true });
-    lease(
-      "browser",
-      { lane: "lane-311-y", tabName: "l311", threadPrefix: "l311-", number: 311 },
-      { path: ledgerPath },
-    );
-    const raw = readFileSync(ledgerPath, "utf8").trim().split("\n");
-    expect(raw.length).toBe(1);
-    expect(JSON.parse(raw[0] ?? "{}")).toMatchObject({
-      event: "acquired",
-      type: "browser",
-      lane: "lane-311-y",
-      tabName: "l311",
-      number: 311,
-    });
-  });
-
-  it("board fixture vocabulary stays anchored", () => {
-    expect(Object.keys(LABEL_IDS)).toContain("ready-for-human");
-    expect(STATUS_FIELD_ID).toBe("F_status");
-    expect(PRIORITY_FIELD_ID).toBe("F_priority");
   });
 });
 

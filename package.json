@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "PM state machine for agent fleets as an omp custom-tool family: pm_lane / pm_apply / pm_audit / pm_release / pm_ledger / pm_walk_ledger / pm_walk",
+  "description": "PM state machine for agent fleets as an omp custom-tool family: pm_lane / pm_apply / pm_audit / pm_walk_ledger / pm_walk",
   "omp": {
     "name": "pm-autopilot",
-    "description": "pm-autopilot board tools: lane dispatch, guarded board writes, drift audit (walk-due rule 8), browser-lease + walk ledgers",
+    "description": "pm-autopilot board tools: lane dispatch, guarded board writes, drift audit (walk-due rule 8), walk ledger",
     "tools": "./src/tools.ts"
   },
   "scripts": {

@@ -41,8 +41,8 @@
  * Tab discipline (#240): the walk runs in a lane-owned named tab (the
  * facade's named-tab space; raw CDP targets the same name via the jev
  * `#__pm_walk:<tabName>` URL-marker recipe, disjoint marker family) — the
- * default tab and other lanes' tabs are never opened or probed. Lanes under
- * a browser lease pass their leased tab name; the walk closes its tab.
+ * default tab and other lanes' tabs are never opened or probed. Each lane
+ * passes its own tab name; the walk closes its tab.
  *
  * Reuse note (anti-NIH 三问): the only in-repo CDP client is
  * scripts/accept/jev-loop.ts, and plugins→scripts would invert the package
@@ -180,7 +180,7 @@ export interface WalkOptions {
    *  kernel browser facade (managed headless Chromium). Env:
    *  PM_WALK_CDP_HTTP forces the raw path session-wide. */
   cdpHttp?: string;
-  /** Lane-owned tab identity (lease discipline #240). Default "pm-walk". */
+  /** Lane-owned tab identity. Default "pm-walk". */
   tabName?: string;
   /** Post-load settle time — SPA hydration/console noise window (ms). */
   settleMs?: number;

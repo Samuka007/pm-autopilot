@@ -1,7 +1,7 @@
 /**
  * tools.ts — #270 the pm-harness custom-tool family for omp.
  *
- * Five model-callable tools over the AP core (./core.ts), registered through
+ * Model-callable tools over the AP core (./core.ts), registered through
  * the omp custom-tools pipeline (package.json `omp.tools` → this module's
  * default-export factory → the same tool registry as the built-ins; with
  * `tools.xdev` enabled they additionally mount under `xd://pm_*`, the
@@ -18,8 +18,6 @@
  *                armed from the repo ledger, incl. #393 rule 9
  *                proseDependencyWithoutEdge); returns pm_apply-ready
  *                mutations (read-only: nothing writes here)
- *   pm_release — browser-lease release (ledger close-out)
- *   pm_ledger  — browser-lease ledger read (events + active set)
  *   pm_walk    — 走查挂账 ledger (#391): register {ticket, due, face},
  *                settle with evidence, or read events + active set
  *
@@ -47,9 +45,7 @@ import {
   STATUS_OPTIONS,
   audit,
   lane,
-  ledger,
   registerSpawnFallback,
-  release,
   renderPreflight,
   snapshot,
   walkDue,
@@ -129,7 +125,6 @@ export interface LaneArgs {
   /** false/omitted → dry-run plan (DoR table + spawn plan, zero writes). */
   confirm?: boolean;
   base?: string;
-  leasesPath?: string;
 }
 
 export type MutationArgs = Mutation;
@@ -141,27 +136,11 @@ export interface ApplyArgs {
 }
 
 export interface AuditArgs {
-  /** Lane numbers the PM believes alive (audit rules 3/4/6a scoping). */
+  /** Lane numbers the PM believes alive (audit rules 3/4 scoping). */
   activeLanes?: number[];
-  /** Arm rule 6 (browser-lease drift) from the repo ledger. Default false —
-   *  audit stays pure unless the caller opts in. */
-  withLeases?: boolean;
-  leasesPath?: string;
   /** Walk-due ledger path override (rule 8 is always armed from the repo
    *  ledger — an overdue deferral must surface on every audit, #391). */
   walksPath?: string;
-}
-
-export interface ReleaseArgs {
-  type: "browser";
-  lane: string;
-  tabName?: string;
-  threadPrefix?: string;
-  leasesPath?: string;
-}
-
-export interface LedgerArgs {
-  leasesPath?: string;
 }
 
 export interface WalkArgs {
@@ -205,7 +184,6 @@ function laneDetails(r: LaneDispatchReport): Record<string, unknown> {
     refusalReasons: r.refusalReasons,
     worktree: r.worktree,
     worktreeCreated: r.worktreeCreated,
-    lease: r.lease,
     blockedBy: r.blockedBy,
     spawned: r.spawned,
     transport: r.transport,
@@ -258,12 +236,6 @@ function renderLane(reports: LaneDispatchReport[]): string {
       ];
       if (r.refusalReasons.length > 0) {
         lines.push(`  refusal: ${r.refusalReasons.join("; ")}`);
-      }
-      if (r.lease !== null) {
-        lines.push(
-          `  lease: ${r.lease.lane} tab=${r.lease.tabName} prefix=${r.lease.threadPrefix}` +
-            (r.lease.registered ? " (registered)" : ""),
-        );
       }
       if (r.blockedBy !== null) {
         const e = r.blockedBy;
@@ -422,7 +394,6 @@ export const createPmHarnessTools = (pi: CustomToolAPI): CustomTool[] => {
         ),
       confirm: confirmNode,
       base: z.string().optional().describe("Worktree base ref (default origin/main)"),
-      leasesPath: z.string().optional().describe("Browser-lease ledger path override"),
     }),
     async execute(_toolCallId, params): Promise<ToolResult> {
       const spec = {
@@ -432,7 +403,6 @@ export const createPmHarnessTools = (pi: CustomToolAPI): CustomTool[] => {
       const opts = {
         confirm: params.confirm === true,
         ...(params.base !== undefined ? { base: params.base } : {}),
-        ...(params.leasesPath !== undefined ? { leasesPath: params.leasesPath } : {}),
         ...(params.blockedBy !== undefined ? { blockedBy: params.blockedBy } : {}),
       };
       // Overload narrowing: single number | Ticket vs the batch array form.
@@ -474,95 +444,22 @@ export const createPmHarnessTools = (pi: CustomToolAPI): CustomTool[] => {
       "Reconcile the project board against reality (read-only): closed-status convergence, dead-lane " +
       "In Progress, active-lane status mismatch, frontier aging, overdue walk deferrals (rule 8, " +
       "always armed: 到期翻红 → Wait for user), prose dependencies without a blockedBy edge " +
-      "(#393, rule 9, advisory), and (with withLeases) browser-lease ledger drift. " +
+      "(#393, rule 9, advisory). " +
       "Returns pm_apply-ready repair mutations — one-shot reconcile is " +
       "pm_audit → pm_apply(mutations, confirm).",
     parameters: z.object({
       activeLanes: z.array(z.number()).optional().describe("Ticket numbers with live lanes"),
-      withLeases: z
-        .boolean()
-        .optional()
-        .describe("Arm rule 6 (browser-lease drift) from the repo lease ledger"),
-      leasesPath: z.string().optional().describe("Browser-lease ledger path override"),
       walksPath: z.string().optional().describe("Walk-due ledger path override"),
     }),
     async execute(_toolCallId, params): Promise<ToolResult> {
       const snap = await snapshot();
       const rep = audit(snap, {
         ...(params.activeLanes !== undefined ? { activeLanes: params.activeLanes } : {}),
-        ...(params.withLeases === true
-          ? {
-              leases: ledger(params.leasesPath !== undefined ? { path: params.leasesPath } : {})
-                .events,
-            }
-          : {}),
         walks: walkLedger(params.walksPath !== undefined ? { path: params.walksPath } : {}).events,
       });
       return {
         content: [{ type: "text", text: renderAudit(rep) }],
         details: auditDetails(rep, snap),
-      };
-    },
-  };
-
-  const releaseTool: CustomTool<ReleaseArgs> = {
-    name: "pm_release",
-    label: "PM Lease Release",
-    description:
-      "Release a shared-resource lease (browser tab/thread discipline): sets releasedAt in the " +
-      "append-only ledger. Refuses when no active lease matches — a release without a lease is a " +
-      "ledger bug, not a no-op. Run at lane delivery/closeout.",
-    parameters: z.object({
-      type: z.enum(["browser"]).describe("Lease type"),
-      lane: z.string().describe("Roster lane id (e.g. lane-239-x)"),
-      tabName: z.string().optional().describe("Named tab (disambiguates multi-lease lanes)"),
-      threadPrefix: z.string().optional().describe("Staging thread prefix"),
-      leasesPath: z.string().optional().describe("Ledger path override"),
-    }),
-    execute(_toolCallId, params): ToolResult {
-      const record = release(
-        params.type,
-        {
-          lane: params.lane,
-          ...(params.tabName !== undefined ? { tabName: params.tabName } : {}),
-          ...(params.threadPrefix !== undefined ? { threadPrefix: params.threadPrefix } : {}),
-        },
-        params.leasesPath !== undefined ? { path: params.leasesPath } : {},
-      );
-      return {
-        content: [
-          {
-            type: "text",
-            text: `== pm_release: ${record.lane} released (${record.type}) ==\n  tab=${record.tabName} prefix=${record.threadPrefix}`,
-          },
-        ],
-        details: { ...record },
-      };
-    },
-  };
-
-  const ledgerTool: CustomTool<LedgerArgs> = {
-    name: "pm_ledger",
-    label: "PM Lease Ledger",
-    description:
-      "Read the shared-resource lease ledger: the full append-only event log plus the replayed " +
-      "active set (leases without a release). Feed `events` to pm_audit's withLeases input.",
-    parameters: z.object({
-      leasesPath: z.string().optional().describe("Ledger path override"),
-    }),
-    execute(_toolCallId, params): ToolResult {
-      const view = ledger(params.leasesPath !== undefined ? { path: params.leasesPath } : {});
-      const lines = [
-        `== pm_ledger: ${view.events.length} event(s), ${view.active.length} active ==`,
-        ...view.active.map(
-          (e) =>
-            `  ACTIVE ${e.type} ${e.lane} tab=${e.tabName} prefix=${e.threadPrefix}` +
-            ` acquired=${e.acquiredAt}`,
-        ),
-      ];
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-        details: { events: view.events, active: view.active },
       };
     },
   };
@@ -656,7 +553,7 @@ export const createPmHarnessTools = (pi: CustomToolAPI): CustomTool[] => {
       tabName: z
         .string()
         .optional()
-        .describe("Lane-owned tab name (lease discipline #240; default 'pm-walk')"),
+        .describe("Lane-owned tab name (default 'pm-walk')"),
       cdpHttp: z
         .string()
         .optional()
@@ -688,7 +585,7 @@ export const createPmHarnessTools = (pi: CustomToolAPI): CustomTool[] => {
     },
   };
 
-  return [laneTool, applyTool, auditTool, releaseTool, ledgerTool, walkLedgerTool, walkProbeTool];
+  return [laneTool, applyTool, auditTool, walkLedgerTool, walkProbeTool];
 };
 
 const factory: CustomToolFactory = createPmHarnessTools;
