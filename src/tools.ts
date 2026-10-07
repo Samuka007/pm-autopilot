@@ -40,8 +40,6 @@ import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { join } from "node:path";
 
-import { execa } from "execa";
-
 import type { Mutation } from "./core.js";
 import {
   apply,
@@ -99,7 +97,11 @@ export function detachedLaneSpawn(p: SpawnRequest): DetachedLaneHandle {
   let out = -1;
   try {
     out = openSync(logPath, "a");
-    const child = spawnDetachedOmp(["-p", p.prompt, "--cwd", p.cwd], out);
+    const child = spawn("omp", ["-p", p.prompt, "--cwd", p.cwd], {
+      detached: true,
+      stdio: ["ignore", out, out],
+    });
+    child.unref();
     return {
       id: `pid-${child.pid ?? "unknown"}`,
       pid: child.pid ?? null,
@@ -110,50 +112,6 @@ export function detachedLaneSpawn(p: SpawnRequest): DetachedLaneHandle {
   } finally {
     if (out !== -1) closeSync(out);
   }
-}
-
-/** execa's TS union for stdout/stderr fds is the 0-9 literal set; its runtime
- *  passes any fd number straight into spawn's stdio (verified against the
- *  real package), so a real open fd from openSync is safe here — the cast is
- *  type-narrowing only, never a behavior change. */
-type ExecaStdoutFd = 3 | 4 | 5 | 6 | 7 | 8 | 9;
-
-/** Child-transport seam for the detached `omp -p` lane (#6, ADR-0001.4).
- *
- *  Production runs execa v9 — same detach / shared-log-fd / fire-and-forget
- *  semantics as the raw spawn it replaces: `detached`, stdin ignored,
- *  stdout+stderr sharing the one append fd, `cleanup: false` so the lane
- *  outlives this process, then `unref()`; `reject: false` plus a swallowed
- *  catch so no child failure ever surfaces a rejection.
- *
- *  Under vitest the raw `node:child_process` binding is used — that IS the
- *  preserved injection seam: tools.test.ts (unchanged) hoists
- *  `vi.mock("node:child_process")` with a bare `{ pid, unref }` child and
- *  asserts this module's spawn call binds the mock. The real execa package
- *  dereferences `.stdio`/`.once`/`.kill` on the child synchronously
- *  (spawnSubprocessAsync) and cannot run against that bare mock. argv, fd
- *  shape, detach and fire-and-forget semantics are identical on both
- *  transports; only the child wrapper differs. */
-function spawnDetachedOmp(args: string[], logFd: number): { pid?: number | undefined; unref(): void } {
-  if (process.env.VITEST === "true") {
-    const child = spawn("omp", args, {
-      detached: true,
-      stdio: ["ignore", logFd, logFd],
-    });
-    child.unref();
-    return child;
-  }
-  const child = execa("omp", args, {
-    detached: true,
-    stdin: "ignore",
-    stdout: logFd as ExecaStdoutFd,
-    stderr: logFd as ExecaStdoutFd,
-    reject: false,
-    cleanup: false,
-  });
-  child.unref();
-  child.catch(() => {});
-  return child;
 }
 
 // ---------------------------------------------------------------------------
