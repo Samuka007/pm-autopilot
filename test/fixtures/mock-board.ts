@@ -198,10 +198,6 @@ export class MockBoard {
       if (query.includes("updateIssue")) {
         const issue = this.issueByNumber(Number(String(variables.id).slice(1)));
         if (issue !== undefined) {
-          // closeIssue passes state as a query literal, not a variable
-          if (variables.state === "CLOSED" || query.includes("state: CLOSED")) {
-            issue.state = "CLOSED";
-          }
           // milestone only touched when the mutation carries it (closeIssue
           // omits the key — a rollback close must not rewrite the milestone)
           if ("milestoneId" in variables) {
@@ -216,9 +212,14 @@ export class MockBoard {
         }
         return { updateIssue: { issue: { number: issue?.number } } };
       }
-      if (query.includes("deleteProjectV2ItemById")) {
+      if (query.includes("closeIssue")) {
+        const issue = this.issueByNumber(Number(String(variables.issueId).slice(1)));
+        if (issue !== undefined) issue.state = "CLOSED";
+        return { closeIssue: { issue: { number: issue?.number, state: "CLOSED" } } };
+      }
+      if (query.includes("deleteProjectV2Item")) {
         this.items = this.items.filter((i) => i.itemId !== variables.itemId);
-        return { deleteProjectV2ItemById: { deletedItemId: variables.itemId } };
+        return { deleteProjectV2Item: { deletedItemId: variables.itemId } };
       }
       if (query.includes("addBlockedBy")) {
         const issue = this.issueByNumber(Number(String(variables.issueId).slice(1)));

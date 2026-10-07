@@ -10,11 +10,17 @@
     "tools": "./src/tools.ts"
   },
   "scripts": {
+    "codegen": "graphql-codegen --config codegen.yml",
+    "schema:sync": "node scripts/sync-schema.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "devDependencies": {
+    "@graphql-codegen/cli": "^7.4.4",
+    "@graphql-codegen/typescript": "^6.1.1",
+    "@graphql-codegen/typescript-operations": "^6.1.10",
     "@types/node": "^22.20.5",
+    "graphql": "^16.14.2",
     "typescript": "~5.9.0",
     "vitest": "^4.1.0"
   },
