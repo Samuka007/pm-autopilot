@@ -29,12 +29,36 @@ guarded-write discipline).
 
 ## Install
 
-```sh
-# user scope (all projects)
-omp plugin link /path/to/pm-autopilot
+Install from the package — user scope, available in every project:
 
-# then verify
+```sh
+omp plugin install github:Samuka007/pm-autopilot
+```
+
+*Owner-only while the repo is private: the `github:` spec authenticates with
+your existing git credentials. Distribution beyond the owner goes through
+npm — see "Distribution" below.*
+
+Verify (all seven `pm_*` tools listed, no missing manifest paths):
+
+```sh
 omp plugin list
+omp plugin doctor pm-autopilot
+```
+
+Upgrade in place — the recorded git ref is re-resolved and the new commit
+picked up without reinstalling:
+
+```sh
+omp plugin upgrade pm-autopilot
+```
+
+Then, once per machine, onboard the GitHub App identity (writes the
+user-scoped 0600 credential store reused by every project — see "Onboarding"
+below):
+
+```sh
+node ~/.omp/plugins/node_modules/pm-autopilot/scripts/onboard_github_app.mjs
 ```
 
 In any omp session the seven tools are then discoverable without any import —
@@ -42,12 +66,22 @@ model-callable directly, callable from the eval kernel as
 `await tool.pm_lane(310, {}, { confirm: true })`, or mounted as `xd://pm_*`
 under `tools.xdev`.
 
+### Development — `omp plugin link` is the dev loop, not a supported install
+
+`omp plugin link /path/to/pm-autopilot` binds the plugin to a live checkout
+and requires the source on every machine; use it only while hacking on the
+plugin itself. Installs from the package (above) are the supported path.
+
 The AP core also loads standalone in the eval JS kernel:
 
 ```js
 %load "/path/to/pm-autopilot/src/core.ts"
 // → installs globalThis.AP (also exported as a named export for vitest)
 ```
+
+(For a package install the same file lives at
+`~/.omp/plugins/node_modules/pm-autopilot/src/core.ts`; with `link`, the
+checkout's path.)
 
 External dependencies: `gh` CLI with `GH_TOKEN` (or an existing `gh auth
 token`); `herdr` only for the default worktree provisioning convention; omp for
@@ -85,7 +119,7 @@ export PM_REPO="you/your-repo"
 gh project list --owner you --format json
 export GH_TOKEN="$(gh auth token)"
 export PM_PROJECT_ID="PVT_yourBoardId"
-omp plugin link /path/to/pm-autopilot
+omp plugin install github:Samuka007/pm-autopilot
 ```
 
 ## Board conventions (documented, not coded)
@@ -272,3 +306,27 @@ pm-autopilot/
 The two #396 decoupling seams, for the record: `PM_WORKTREE_ROOT` (worktree
 backend root, default `~/.herdr/worktrees`) and the classify prompt naming
 `PM_REPO`'s repo instead of a hardcoded name.
+
+## Distribution — npm publish (manual, deliberate)
+
+The plugin installs from the git spec today; npm distribution is prepared but
+not automated. No npm token is configured, so there is **no publish workflow**
+in `.github/` — by design, no dead YAML. When distributing beyond the owner
+becomes wanted:
+
+1. `pnpm login` with an npm account that owns the `pm-autopilot` name.
+2. Package hygiene is already in place — `files` whitelist (`src/`,
+   `scripts/`, `agents/`, `README.md`), `engines.node >= 20`, and
+   `prepublishOnly: pnpm typecheck && pnpm test` as the publish gate.
+3. Flip `"private": true` to `false` in `package.json` — npm refuses to
+   publish private packages, which is the intended guard against accidental
+   releases; the git repo itself stays private.
+4. Bump `version`, cut a `v<version>` tag, run `pnpm publish`. Consumers then
+   install with `omp plugin install pm-autopilot`.
+
+## License
+
+Proprietary — all rights reserved. There is no `LICENSE` file and none is
+granted; `package.json` carries `"license": "UNLICENSED"` plus
+`"private": true`. Distribution is owner-only via the private GitHub repo
+until an npm or public release is deliberately prepared (see "Distribution").
