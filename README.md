@@ -65,6 +65,10 @@ minimum `PM_REPO` + `PM_PROJECT_ID`.
 | `PM_REPO` | `Samuka007/cloudflare-agent-project` | `owner/name` of the audited repo + board. Also injected into the jev classify prompt (#396 — the prompt names YOUR repo, no hardcoding). |
 | `PM_PROJECT_ID` | `PVT_kwHOAvgCqs4Blk19` | GitHub Projects V2 GraphQL id. Field/option ids are ALWAYS resolved live at runtime — only this container id is configured. |
 | `GH_TOKEN` | `gh auth token` fallback | GitHub token for GraphQL reads/writes. |
+| `PM_GITHUB_APP_ID` | unset | GitHub App id (#5). Set together with `PM_GITHUB_APP_PRIVATE_KEY`/`PM_GITHUB_APP_KEY_PATH` to route all board writes through an installation token (`pm-autopilot[bot]` attribution — see "Agent identity"). |
+| `PM_GITHUB_APP_PRIVATE_KEY` | unset | App private key, PEM. May be single-line with `\n` escapes. Mutually exclusive with `PM_GITHUB_APP_KEY_PATH`. |
+| `PM_GITHUB_APP_KEY_PATH` | unset | Path to the App private key PEM file (alternative to inlining it). |
+| `PM_GITHUB_INSTALLATION_ID` | unset | Overrides per-repo installation resolution (#5): when set, every repo uses this installation id without the lookup. |
 | `JEV_API_KEY` | gitignored `.env.local` at the repo root | Judge (intake/file classification) only — the seven tools never touch jev. Real-call smoke skips itself without a key. |
 | `PM_WORKTREE_ROOT` | `~/.herdr/worktrees` | Worktree-root seam (#396): re-points packet paths AND `AP.lane`'s `git worktree add` target at a non-herdr provisioning backend without code changes. |
 | `PM_LEASES_PATH` | `.pm-leases.jsonl` at the package root | Browser-lease ledger (append-only, gitignored). |
@@ -102,6 +106,42 @@ logic, so they are documented here rather than parameterized:
 - The tracker-schema axes doc (`docs/agents/tracker-schema.md` in the consumer
   repo) is referenced by name in classify prompts — ship an equivalent schema
   doc in your repo.
+
+## Agent identity (GitHub App)
+
+Attribution is credential-determined: whoever owns the token authors the
+issues. Only a GitHub App's **installation (server-to-server) token** produces
+the `pm-autopilot[bot]` author badge; user tokens (PAT, `gh auth token`,
+OAuth user-to-server) always attribute to the human. No code path relies on
+the display name — the credential IS the identity (#5, ADR-0001 §2).
+
+Credential resolution order (ADR-0002 §3):
+
+1. **Process env** — `PM_GITHUB_APP_ID` + `PM_GITHUB_APP_PRIVATE_KEY` (PEM) or
+   `PM_GITHUB_APP_KEY_PATH`. The CI/herdr-lane override surface; repo
+   `.env.local` is deliberately NOT read for App credentials.
+2. **User store** — `~/.config/pm-autopilot/credentials.json` (mode 0600,
+   `XDG_CONFIG_HOME`-aware), written once by the onboarding flow and reused
+   across every project. Keys: `app_id`, `private_key` (PEM) or
+   `private_key_path` (relative paths anchor at the store's directory),
+   optional `default_installation_id` (legacy alias:
+   `first_installation_id`).
+3. **Neither** → the existing chain (`GH_TOKEN` → `gh auth token`), unchanged.
+
+A partially-configured identity (id without key, malformed store) throws —
+it never silently degrades to user-token writes, which would misattribute
+them to the human account.
+
+Installation tokens resolve **per target repo** (`PM_REPO`):
+`GET /repos/{owner}/{repo}/installation` (app-JWT Bearer) is looked up and
+cached in-process per repo; when the lookup finds no installation there
+(HTTP 404 — App not on that repo), the store's `default_installation_id`
+stands in. `PM_GITHUB_INSTALLATION_ID` overrides the resolution entirely.
+`@octokit/auth-app` mints, caches, and re-mints the ~1h tokens transparently,
+so long PM sessions never ride an expired Bearer.
+
+Required App permissions (no webhooks): `metadata: read`, `issues: write`,
+`projects: write` on the selected repositories.
 
 ## Quickstart — one PM turn
 
@@ -145,8 +185,10 @@ pm-guard agent def encodes exactly this discipline.
   live in `.pm-*.jsonl` files that are never committed; lease discipline
   (named tab + thread prefix + release obligation) is enforced at dispatch.
 - **No secrets in code.** `GH_TOKEN` / `JEV_API_KEY` come from env or a
-  gitignored `.env.local`. Judge replies classify only — nothing auto-writes;
-  the gate decides who reads the result.
+  gitignored `.env.local`; GitHub App credentials (#5) come from env or the
+  user-scoped 0600 store (`~/.config/pm-autopilot/credentials.json`) — never
+  from git. Judge replies classify only — nothing auto-writes; the gate
+  decides who reads the result.
 
 ## Spawn transport ladder (`pm_lane`)
 

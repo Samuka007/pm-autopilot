@@ -219,6 +219,7 @@ import type { RetryOptions } from "@octokit/plugin-retry";
 import type { ThrottlingOptions } from "@octokit/plugin-throttling";
 import { Octokit } from "octokit";
 
+import { createInstallationTokenProvider, resolveAppCredentials } from "./identity.js";
 import { validateWalkSpec, walk, walkVerdict } from "./walk.js";
 
 export type {
@@ -497,7 +498,15 @@ function runGit(args: string[], cwd: string): string {
  *  budget. `fetch?` lets unit tests drive the REAL Octokit path against a
  *  stub — the `_inject({ gql })` seam stays authoritative for offline runs. */
 export function makeGql(fetch?: FetchFn): GqlFn {
-  const token = resolveToken();
+  // Auth strategy resolution (#5, ADR-0001 §2): App credentials configured →
+  // per-repo installation-token provider (attribution to pm-autopilot[bot]);
+  // absent → the legacy chain below, byte-identical behavior.
+  const appCredentials = resolveAppCredentials();
+  const tokenProvider =
+    appCredentials === null
+      ? null
+      : createInstallationTokenProvider(appCredentials, fetch === undefined ? {} : { fetch });
+  const legacyToken = tokenProvider === null ? resolveToken() : null;
   const octokit = new Octokit({
     userAgent: "pm-autopilot (#131)",
     retry: { retries: 3 },
@@ -518,6 +527,11 @@ export function makeGql(fetch?: FetchFn): GqlFn {
     // (withAuthorizationPrefix) — today's wire format is `Bearer <t>`, and
     // GitHub's GraphQL endpoint accepts the explicit header unchanged.
     // `headers` is a reserved graphql option key, never a variable name.
+    // Installation tokens expire ~1h; the provider's auth-app cache re-mints
+    // transparently within this one client, so a long session never rides an
+    // expired Bearer (#5).
+    const token =
+      tokenProvider === null ? (legacyToken as string) : await tokenProvider(REPO);
     const data = (await octokit.graphql(query, {
       ...variables,
       headers: { authorization: `Bearer ${token}` },
