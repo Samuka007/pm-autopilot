@@ -91,7 +91,8 @@
  *     await AP.lane(t);                   // dry-run: DoR table + spawn plan, zero writes
  *     await AP.lane(t, { agent: "task" }, { confirm: true });
  *                                      // runs `git worktree add <herdr path>
- *                                      // -b lane/<ticket>-<slug> origin/main`, returns
+ *                                      // -b lane/<ticket>-<slug> origin/main` +
+ *                                      // `git submodule update --init` (#456), returns
  *                                      // spawn { agent, isolated: true, task, context }.
  *                                      // A failed board predicate refuses dispatch;
  *                                      // DoR gaps (三问/验收/锚点, #224) are
@@ -780,6 +781,7 @@ export function dispatchPackets(tickets: Ticket[], _snapshot?: Snapshot): Dispat
       ``,
       `# Worktree (PM pre-creates; lane never touches the main checkout)`,
       command,
+      `git -C ${path} submodule update --init`,
       `cd ${path}`,
       ``,
       `# Branch discipline`,
@@ -818,8 +820,9 @@ export function dispatchPackets(tickets: Ticket[], _snapshot?: Snapshot): Dispat
 // ---------------------------------------------------------------------------
 // AP.lane (#171) — the dispatch gate: DoR preflight → worktree provision →
 // isolated spawn packet. Composes dispatchable/dispatchPackets; confirm-path
-// side effects: `git worktree add` (#171), the real spawn (#206 transport),
-// and the guarded board Status flip (#206, the pipeline owns it).
+// side effects: `git worktree add` (#171) → `git submodule update --init`
+// in the fresh tree (#456), the real spawn (#206 transport), and the guarded
+// board Status flip (#206, the pipeline owns it).
 // ---------------------------------------------------------------------------
 
 /** One DoR line printed per dispatch: gate item, pass/fail, body evidence. */
@@ -1159,7 +1162,9 @@ function renderLaneReport(r: LaneDispatchReport): string {
  * table rides along as ADVISORY for the PM and never refuses; (b) on
  * confirm, runs
  * `git worktree add <herdr path> -b lane/<ticket>-<slug> origin/main` at the
- * deterministic herdr path (naming reused from dispatchPackets); (c, #206)
+ * deterministic herdr path (naming reused from dispatchPackets), then
+ * `git submodule update --init` in the new tree (#456 — the lane enters a
+ * fully initialized checkout; repos without submodules no-op); (c, #206)
  * spawns the lane for real through the spawn transport — default
  * `(p) => globalThis.agent(p.prompt, {isolated: true, label: p.label})`, the
  * registerSpawn slot overrides (test mock / pm-harness weave) — and then
@@ -1326,6 +1331,20 @@ async function laneOne(
   } catch (err) {
     report.errors.push(
       `git worktree add failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    console.log(renderLaneReport(report));
+    return report;
+  }
+  // #456: the lane enters the worktree WITH its submodules initialized — the
+  // per-lane `submodule update --init` setup tax (5/5 lanes of one wave paid
+  // it) is provisioning work, not lane work. Fatal like the add above: a
+  // half-provisioned tree is the exact bug this closes; repos without
+  // submodules no-op (exit 0).
+  try {
+    runGit(["submodule", "update", "--init"], target);
+  } catch (err) {
+    report.errors.push(
+      `git submodule update --init failed: ${err instanceof Error ? err.message : String(err)}`,
     );
     console.log(renderLaneReport(report));
     return report;
