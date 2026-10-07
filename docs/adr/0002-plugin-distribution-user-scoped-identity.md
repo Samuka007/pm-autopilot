@@ -25,7 +25,7 @@ Terminology: the identity is a **GitHub App**, not an OAuth App. Only a GitHub A
 
 ## Alternatives considered
 
-- **`omp plugin config set` as the credential store**: first-class CLI and project-override semantics, but settings are not injected into custom-tool factories (undocumented/brittle lockfile reads would be required). Rejected as the store; revisit if omp adds a documented settings API for tools.
+- **`omp plugin config set` as the credential store**: first-class CLI and project-override semantics, but two runtime read paths both fail. Custom-tool factories (this plugin's integration) receive a fixed API with no settings field (`omp://custom-tools.md`). Extensions do have a documented read API, but it targets the **global settings registry** (`lookup(id)` + `pi.pi.settings`, `omp://extensions.md`), which plugins cannot register their own setting handles into — `register({id, ...})` happens only inside omp's own domain modules. The per-plugin settings that `omp plugin config set` persists to `omp-plugins.lock.json` therefore have no documented delivery into plugin code; reading them means parsing omp's private lockfile format. Rejected as the store; revisit if omp documents a plugin-settings injection path for tools.
 - **Per-repo `.env.local` only** (ADR-0001 original): simplest, but exactly the per-project binding this ADR removes. Kept only as the lowest-priority fallback.
 - **npm-only distribution**: adds a publish step and registry dependency before the plugin is installable at all; git spec works today. Rejected as primary.
 
